@@ -1,7 +1,7 @@
 #!/usr/bin/env php
 <?php
 /**
- * shop-anonymizer.php
+ * wp-anonymizer.php
  *
  * Exports an anonymized copy of a WordPress/WooCommerce shop database
  * WITHOUT EVER writing to the production database.
@@ -10,7 +10,7 @@
  *       anonymization -> verification -> final dump -> cleanup.
  *
  * Requirements: PHP >= 7.4 CLI, WP-CLI, mysql/mysqldump client.
- * Usage: php shop-anonymizer.php [--path=/var/www/shop] [--dry-run] [--output-dir=./anon-export]
+ * Usage: php wp-anonymizer.php [--path=/var/www/shop] [--dry-run] [--output-dir=./anon-export]
  */
 
 declare(strict_types=1);
@@ -489,9 +489,9 @@ if ($opts['config'] !== null) {
 
 function usage(): void
 {
-    out("\n  shop-anonymizer v" . APP_VERSION . "\n" . <<<TXT
+    out("\n  wp-anonymizer v" . APP_VERSION . "\n" . <<<TXT
 Usage:
-  php shop-anonymizer.php [options]
+  php wp-anonymizer.php [options]
 
   --path=DIR                 WordPress installation root (default: current directory)
   --output-dir=DIR           Private output directory (default: ./anon-export)
@@ -508,7 +508,7 @@ TXT
 // 1. PREFLIGHT
 // ===========================================================================
 step('Preflight');
-out('shop-anonymizer v' . APP_VERSION);
+out('wp-anonymizer v' . APP_VERSION);
 warn('Run this tool only against a disposable workflow with a dedicated private output directory.');
 
 $wpBin = which('wp') ?: which('wp-cli') ?: which('wp-cli.phar');
@@ -1836,7 +1836,7 @@ $command = $baseDump . ' ' . escapeshellarg($tmpDb) . ' > ' . escapeshellarg($fi
 if (sh($command, $output, $errors) !== 0) fail("Final dump failed:\n" . diag($output, $errors));
 if (!is_file($finalSql) || filesize($finalSql) === 0) fail('Final SQL dump is empty.');
 
-$artifactStem = 'shop-anon-' . $runId;
+$artifactStem = 'wp-anon-' . $runId;
 $artifactName = $artifactStem . '.sql.gz';
 $stageArtifact = $stageDir . '/' . $artifactName;
 createPrivateFile($stageArtifact);
@@ -1906,7 +1906,7 @@ foreach ($rowCounts as $table => $rows) {
 }
 $manifest = [
     'generated_at' => gmdate('c'),
-    'tool' => 'shop-anonymizer',
+    'tool' => 'wp-anonymizer',
     'tool_version' => APP_VERSION,
     'source_database' => $db['name'],
     'table_prefix' => $p,

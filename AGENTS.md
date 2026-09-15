@@ -2,16 +2,16 @@
 
 ## Project Structure & Module Organization
 
-This is a focused PHP CLI utility. `shop-anonymizer.php` contains the application: terminal helpers, interactive configuration, table rules, temporary-schema processing, verification, artifact creation, and cleanup. Keep new behavior near the numbered section it extends and reusable logic in the helper area. `README.md` is the operator guide and security contract; update it whenever options, prerequisites, outputs, or guarantees change. There is no separate `src/`, `tests/`, or assets directory.
+This is a focused PHP CLI utility. `wp-anonymizer.php` contains the application: terminal helpers, interactive configuration, table rules, temporary-schema processing, verification, artifact creation, and cleanup. Keep new behavior near the numbered section it extends and reusable logic in the helper area. `README.md` is the operator guide and security contract; update it whenever options, prerequisites, outputs, or guarantees change. There is no separate `src/`, `tests/`, or assets directory.
 
 ## Build, Test, and Development Commands
 
 No dependency installation or build step is required. Use PHP 7.4 or newer.
 
 ```bash
-php -l shop-anonymizer.php
-php shop-anonymizer.php --help
-php shop-anonymizer.php --path=/var/www/shop --dry-run
+php -l wp-anonymizer.php
+php wp-anonymizer.php --help
+php wp-anonymizer.php --path=/var/www/shop --dry-run
 ```
 
 The first command performs the required syntax check. The second checks CLI option rendering. The dry run exercises planning without modifying the source database; use a disposable WordPress shop and dedicated output directory because it can write local configuration.

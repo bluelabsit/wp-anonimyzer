@@ -1,6 +1,6 @@
-# Shop Anonymizer
+# WP Anonymizer
 
-Shop Anonymizer is a focused PHP CLI utility that exports a pseudonymized copy
+WP Anonymizer is a focused PHP CLI utility that exports a pseudonymized copy
 of a WordPress/WooCommerce database for development and test environments.
 It never runs transformation statements against the source database: data is
 read from the source, imported into a separate working schema, transformed,
@@ -62,15 +62,15 @@ No dependency installation or build step is required.
 
 ```bash
 # Inspect the plan. The source database remains read-only.
-php shop-anonymizer.php --path=/var/www/shop --dry-run
+php wp-anonymizer.php --path=/var/www/shop --dry-run
 
 # Perform an export.
-php shop-anonymizer.php \
+php wp-anonymizer.php \
     --path=/var/www/shop \
     --output-dir=/srv/anon-export
 
 # Replay a reviewed version-1 configuration.
-php shop-anonymizer.php \
+php wp-anonymizer.php \
     --path=/var/www/shop \
     --config=/srv/anon-export/run-config.json
 ```
@@ -175,9 +175,9 @@ For run ID `<run-id>`, a successful export produces:
 
 | File | Contents |
 |---|---|
-| `shop-anon-<run-id>.sql.gz` | Compressed SQL artifact |
-| `shop-anon-<run-id>.sha256` | SHA-256 checksum for that artifact |
-| `shop-anon-<run-id>.manifest.json` | Evidence, checks, exceptions, and cleanup status |
+| `wp-anon-<run-id>.sql.gz` | Compressed SQL artifact |
+| `wp-anon-<run-id>.sha256` | SHA-256 checksum for that artifact |
+| `wp-anon-<run-id>.manifest.json` | Evidence, checks, exceptions, and cleanup status |
 | `run-config.json` | Replayable wizard choices (`config_version: 1`) |
 | `.anon-seed` (or `--seed-file`) | Private pseudonymization seed; never transfer with the dump |
 
@@ -196,7 +196,7 @@ be sensitive. Keep the entire output directory access-controlled.
 Encrypt the archive before transfer:
 
 ```bash
-gpg -c --cipher-algo AES256 shop-anon-<run-id>.sql.gz
+gpg -c --cipher-algo AES256 wp-anon-<run-id>.sql.gz
 ```
 
 Send the passphrase and checksum over a channel separate from the artifact.
@@ -206,17 +206,17 @@ The recipient should:
 
 ```bash
 # 1. Decrypt (GnuPG prompts interactively).
-gpg --output shop-anon-<run-id>.sql.gz \
-    --decrypt shop-anon-<run-id>.sql.gz.gpg
+gpg --output wp-anon-<run-id>.sql.gz \
+    --decrypt wp-anon-<run-id>.sql.gz.gpg
 
 # 2. Verify integrity.
-sha256sum -c shop-anon-<run-id>.sha256       # Linux
-shasum -a 256 -c shop-anon-<run-id>.sha256  # macOS
+sha256sum -c wp-anon-<run-id>.sha256       # Linux
+shasum -a 256 -c wp-anon-<run-id>.sha256  # macOS
 
 # 3. Import into a new, empty test database.
 mysql -u root -p -e \
     "CREATE DATABASE shop_test CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-gunzip -c shop-anon-<run-id>.sql.gz | mysql -u root -p shop_test
+gunzip -c wp-anon-<run-id>.sql.gz | mysql -u root -p shop_test
 
 # 4. Rewrite URLs after import; WordPress serialization is handled by WP-CLI.
 wp search-replace \
@@ -265,8 +265,8 @@ data-protection obligations.
 Run these checks for every change:
 
 ```bash
-php -l shop-anonymizer.php
-php shop-anonymizer.php --help
+php -l wp-anonymizer.php
+php wp-anonymizer.php --help
 git diff --check
 ```
 
