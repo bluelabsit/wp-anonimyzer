@@ -11,8 +11,6 @@
  *
  * Requirements: PHP >= 7.4 CLI, WP-CLI, mysql/mysqldump client.
  * Usage: php shop-anonymizer.php [--path=/var/www/shop] [--dry-run] [--output-dir=./anon-export]
- *
- * Xeader — Antonio Gatta <a.gatta@xeader.com>
  */
 
 declare(strict_types=1);
@@ -33,21 +31,25 @@ if (version_compare(PHP_VERSION, '7.4.0', '<')) {
 }
 
 // ---------------------------------------------------------------------------
-// Global state used by the cleanup routine
+// Global state used by cleanup routine
 // ---------------------------------------------------------------------------
 $GLOBALS['CTX'] = [
         'defaults_file' => null,
-        'tmp_db'        => null,
-        'tmp_files'     => [],
-        'keep_temp'     => false,
-        'mysql'         => 'mysql',
-        'cleaned'       => false,
+        'tmp_db' => null,
+        'tmp_db_owned' => false,
+        'prepared_cleanup' => 'empty',
+        'tmp_files' => [],
+        'tmp_dirs' => [],
+        'mysql' => 'mysql',
+        'cleaning' => false,
+        'cleaned' => false,
 ];
 
+$hasPcntl = function_exists('pcntl_signal') && function_exists('pcntl_async_signals');
 register_shutdown_function('cleanup');
-if (function_exists('pcntl_signal') && function_exists('pcntl_async_signals')) {
+if ($hasPcntl) {
     pcntl_async_signals(true);
-    pcntl_signal(SIGINT,  function () { out("\nInterrupted by the user."); exit(130); });
+    pcntl_signal(SIGINT, function () { out("\nInterrupted by the user."); exit(130); });
     pcntl_signal(SIGTERM, function () { exit(143); });
 }
 
@@ -131,13 +133,13 @@ function choose(string $question, array $options, int $default = 0): int
 }
 
 // ---------------------------------------------------------------------------
-// Command execution
+// Command execution, SQL/file safety and cleanup
 // ---------------------------------------------------------------------------
 function sh(string $cmd, ?array &$output = null, ?array &$errors = null): int
 {
     $output = [];
-    $errors  = [];
-    $code    = 0;
+    $errors = [];
+    $code = 0;
     $errFile = tempnam(sys_get_temp_dir(), 'anonerr_');
     if ($errFile === false) {
         exec($cmd, $output, $code);
@@ -150,275 +152,496 @@ function sh(string $cmd, ?array &$output = null, ?array &$errors = null): int
     return $code;
 }
 
-/** Diagnostic message combining a command stdout and stderr. */
 function diag(array $out, array $err): string
 {
-    $all = array_filter(array_merge($out, $err), function ($l) { return trim($l) !== ''; });
-    return $all ? '  ' . implode("\n  ", $all) : '  (no output)';
-}
-
-/**
- * Strips the lines emitted by the PHP engine itself (extension warnings,
- * deprecations, stack traces) from WP-CLI output: they are not part of the value.
- */
-function cleanOutput(array $lines): array
-{
-    $clean = [];
-    foreach ($lines as $l) {
-        $t = trim($l);
-        if ($t === '') continue;
-        if (preg_match('/^(PHP )?(Warning|Notice|Deprecated|Strict Standards|Fatal error|Parse error|Stack trace)\b/i', $t)) continue;
-        if (preg_match('/^(PHP )?\s*#\d+\s/', $t)) continue;
-        if (preg_match('/^\s*thrown in .* on line \d+/i', $t)) continue;
-        $clean[] = $l;
-    }
-    return $clean;
+    $all = array_filter(array_merge($out, $err), function ($line) {
+        return trim((string)$line) !== '';
+    });
+    return $all ? "  " . implode("\n  ", $all) : '  (no output)';
 }
 
 function which(string $bin): ?string
 {
-    $o = [];
-    if (sh('command -v ' . escapeshellarg($bin), $o) === 0 && !empty($o[0])) return trim($o[0]);
+    $output = [];
+    if (sh('command -v ' . escapeshellarg($bin), $output) === 0 && !empty($output[0])) {
+        return trim((string)$output[0]);
+    }
     return null;
 }
 
-/** Runs a SELECT and returns rows as an array of arrays (tab-separated). */
-function q(string $sql, ?string $db = null): array
+function sqlIdentifier(string $identifier): string
 {
-    $cmd = mysqlCmd($db) . ' -N -B -e ' . escapeshellarg($sql);
-    $o = []; $e = [];
-    if (sh($cmd, $o, $e) !== 0) fail("Query failed:\n  " . $sql . "\n" . diag($o, $e));
+    if ($identifier === '' || strpos($identifier, "\0") !== false) {
+        fail('Invalid empty or NUL-containing SQL identifier.');
+    }
+    return '`' . str_replace('`', '``', $identifier) . '`';
+}
+
+function sqlString(string $value): string
+{
+    if ($value === '') return "''";
+    // Hex encoding makes the literal independent of NO_BACKSLASH_ESCAPES and
+    // prevents database-derived metadata keys from altering generated SQL.
+    return 'CONVERT(0x' . bin2hex($value) . ' USING utf8mb4)';
+}
+
+function encodeJsonOrFail($value, int $flags = 0): string
+{
+    $json = json_encode($value, $flags);
+    if ($json === false) fail('Could not encode JSON: ' . json_last_error_msg());
+    return $json;
+}
+
+function assertTempSchemaName(string $schema): void
+{
+    if (strlen($schema) > 64 || !preg_match('/^' . TMP_PREFIX . '[A-Za-z0-9_]+$/', $schema)) {
+        fail('Working schema must match ' . TMP_PREFIX . '[A-Za-z0-9_]+ and be at most 64 characters.');
+    }
+}
+
+function ensurePrivateDirectory(string $dir): void
+{
+    if (is_link($dir)) fail('Output directory must not be a symlink: ' . $dir);
+    if (!is_dir($dir) && !@mkdir($dir, 0700, true)) fail('Could not create ' . $dir);
+    if (!@chmod($dir, 0700)) fail('Could not restrict output directory permissions: ' . $dir);
+    $mode = @fileperms($dir);
+    if ($mode === false || (($mode & 0777) !== 0700)) fail('Output directory must have mode 0700: ' . $dir);
+}
+
+function createPrivateFile(string $file): void
+{
+    if (is_link($file) || file_exists($file)) fail('Refusing to overwrite existing path: ' . $file);
+    $oldUmask = umask(0177);
+    $handle = @fopen($file, 'x');
+    umask($oldUmask);
+    if ($handle === false) fail('Could not create private file: ' . $file);
+    if (!@chmod($file, 0600)) {
+        fclose($handle);
+        @unlink($file);
+        fail('Could not restrict file permissions: ' . $file);
+    }
+    if (!fclose($handle)) {
+        @unlink($file);
+        fail('Could not close private file: ' . $file);
+    }
+}
+
+function writePrivateFile(string $file, string $contents): void
+{
+    $tmp = $file . '.tmp-' . bin2hex(random_bytes(6));
+    createPrivateFile($tmp);
+    $GLOBALS['CTX']['tmp_files'][] = $tmp;
+    $handle = @fopen($tmp, 'wb');
+    if ($handle === false) fail('Could not open private file for writing: ' . $tmp);
+    $length = strlen($contents);
+    $offset = 0;
+    while ($offset < $length) {
+        $written = fwrite($handle, substr($contents, $offset));
+        if ($written === false || $written === 0) {
+            fclose($handle);
+            fail('Could not completely write ' . $tmp);
+        }
+        $offset += $written;
+    }
+    $flushed = fflush($handle);
+    $closed = fclose($handle);
+    if (!$flushed || !$closed) fail('Could not finalize ' . $tmp);
+    if (is_link($file) || !@rename($tmp, $file)) fail('Could not publish ' . $file);
+    $GLOBALS['CTX']['tmp_files'] = array_values(array_diff($GLOBALS['CTX']['tmp_files'], [$tmp]));
+    if (!@chmod($file, 0600)) {
+        $GLOBALS['CTX']['tmp_files'][] = $file;
+        fail('Could not restrict file permissions: ' . $file);
+    }
+}
+
+function mysqlCmd(?string $db = null): string
+{
+    $ctx = $GLOBALS['CTX'];
+    if (!$ctx['defaults_file'] || !is_file($ctx['defaults_file'])) fail('MySQL credentials file is unavailable.');
+    $cmd = escapeshellarg($ctx['mysql'])
+        . ' --defaults-extra-file=' . escapeshellarg($ctx['defaults_file'])
+        . ' --default-character-set=utf8mb4';
+    if ($db !== null) $cmd .= ' ' . escapeshellarg($db);
+    return $cmd;
+}
+
+function queryRows(string $sql, ?string $db, ?array &$errors = null): ?array
+{
+    $statement = trim($sql);
+    if (!preg_match('/^(SELECT|SHOW)\b/i', $statement) || strpos(rtrim($statement, ';'), ';') !== false) {
+        $errors = ['Rejected non-read-only or multi-statement query.'];
+        return null;
+    }
+    $output = [];
+    $err = [];
+    $code = sh(mysqlCmd($db) . ' -N -B -e ' . escapeshellarg($statement), $output, $err);
+    if ($code !== 0) {
+        $errors = array_merge($output, $err);
+        return null;
+    }
     $rows = [];
-    foreach ($o as $line) {
+    foreach ($output as $line) {
         if ($line === '') continue;
         $rows[] = explode("\t", $line);
     }
+    $errors = [];
+    return $rows;
+}
+
+function q(string $sql, ?string $db = null): array
+{
+    $errors = [];
+    $rows = queryRows($sql, $db, $errors);
+    if ($rows === null) fail("Read-only query failed:\n  " . $sql . "\n" . diag([], $errors));
     return $rows;
 }
 
 function qScalar(string $sql, ?string $db = null, string $fallback = ''): string
 {
-    $r = q($sql, $db);
-    return isset($r[0][0]) ? $r[0][0] : $fallback;
+    $rows = q($sql, $db);
+    return isset($rows[0][0]) ? $rows[0][0] : $fallback;
 }
 
-/** Runs an SQL script from a file. Stops at the first error (no --force). */
-function execSqlFile(string $file, ?string $db = null): void
+function runMysqlSql(string $sql, ?string $db = null, ?array &$errors = null): bool
 {
-    $cmd = mysqlCmd($db) . ' < ' . escapeshellarg($file);
-    $o = []; $e = [];
-    if (sh($cmd, $o, $e) !== 0) fail("SQL execution failed (" . basename($file) . "):\n" . diag($o, $e));
+    $output = [];
+    $err = [];
+    $code = sh(mysqlCmd($db) . ' -e ' . escapeshellarg($sql), $output, $err);
+    $errors = array_merge($output, $err);
+    return $code === 0;
 }
 
-function mysqlCmd(?string $db = null): string
+function execSqlFile(string $file, string $db): void
 {
-    $c = $GLOBALS['CTX'];
-    $cmd = escapeshellarg($c['mysql'])
-           . ' --defaults-extra-file=' . escapeshellarg($c['defaults_file'])
-           . ' --default-character-set=utf8mb4';
-    if ($db !== null) $cmd .= ' ' . escapeshellarg($db);
-    return $cmd;
+    $ctx = $GLOBALS['CTX'];
+    assertTempSchemaName($db);
+    if ($ctx['tmp_db'] !== $db) fail('Refusing SQL execution outside registered temporary schema.');
+    $output = [];
+    $errors = [];
+    if (sh(mysqlCmd($db) . ' < ' . escapeshellarg($file), $output, $errors) !== 0) {
+        fail("SQL execution failed (" . basename($file) . "):\n" . diag($output, $errors));
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Cleanup (always runs, including on error)
-// ---------------------------------------------------------------------------
+function purgeSchema(string $schema): bool
+{
+    assertTempSchemaName($schema);
+    $errors = [];
+    $rows = queryRows(
+        'SELECT table_name, table_type FROM information_schema.tables WHERE table_schema=' . sqlString($schema),
+        null,
+        $errors
+    );
+    if ($rows === null) {
+        warn('Could not inventory working schema during cleanup:' . diag([], $errors));
+        return false;
+    }
+    $routines = queryRows(
+        'SELECT routine_name, routine_type FROM information_schema.routines WHERE routine_schema=' . sqlString($schema),
+        null,
+        $errors
+    );
+    $events = queryRows(
+        'SELECT event_name FROM information_schema.events WHERE event_schema=' . sqlString($schema),
+        null,
+        $errors
+    );
+    if ($routines === null || $events === null) {
+        warn('Could not inventory working schema routines/events during cleanup:' . diag([], $errors));
+        return false;
+    }
+    $views = [];
+    $tables = [];
+    foreach ($rows as $row) {
+        if (($row[1] ?? '') === 'VIEW') $views[] = sqlIdentifier($row[0]);
+        else $tables[] = sqlIdentifier($row[0]);
+    }
+    foreach ([['DROP VIEW IF EXISTS ', $views], ['DROP TABLE IF EXISTS ', $tables]] as $drop) {
+        foreach (array_chunk($drop[1], 50) as $chunk) {
+            if (!$chunk) continue;
+            $sql = 'SET FOREIGN_KEY_CHECKS=0; ' . $drop[0] . implode(',', $chunk) . '; SET FOREIGN_KEY_CHECKS=1';
+            if (!runMysqlSql($sql, $schema, $errors)) {
+                warn('Working schema cleanup command failed:' . diag([], $errors));
+                return false;
+            }
+        }
+    }
+    foreach ($routines as $routine) {
+        $type = strtoupper((string)($routine[1] ?? ''));
+        if (!in_array($type, ['FUNCTION', 'PROCEDURE'], true)) {
+            warn('Unexpected routine type during cleanup: ' . $type);
+            return false;
+        }
+        $sql = 'DROP ' . $type . ' IF EXISTS '
+            . sqlIdentifier($schema) . '.' . sqlIdentifier((string)$routine[0]);
+        if (!runMysqlSql($sql, null, $errors)) {
+            warn('Working schema routine cleanup failed:' . diag([], $errors));
+            return false;
+        }
+    }
+    foreach ($events as $event) {
+        $sql = 'DROP EVENT IF EXISTS '
+            . sqlIdentifier($schema) . '.' . sqlIdentifier((string)$event[0]);
+        if (!runMysqlSql($sql, null, $errors)) {
+            warn('Working schema event cleanup failed:' . diag([], $errors));
+            return false;
+        }
+    }
+    $remaining = queryRows(
+        'SELECT '
+        . '(SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=' . sqlString($schema) . ') + '
+        . '(SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema=' . sqlString($schema) . ') + '
+        . '(SELECT COUNT(*) FROM information_schema.events WHERE event_schema=' . sqlString($schema) . ')',
+        null,
+        $errors
+    );
+    return $remaining !== null && (int)($remaining[0][0] ?? -1) === 0;
+}
+
+function cleanupDatabase(): bool
+{
+    $ctx = &$GLOBALS['CTX'];
+    if (!$ctx['tmp_db']) return true;
+    $schema = $ctx['tmp_db'];
+    assertTempSchemaName($schema);
+    $dropRequested = $ctx['tmp_db_owned'] || $ctx['prepared_cleanup'] === 'drop';
+    $dropped = false;
+    $errors = [];
+    if ($dropRequested) {
+        for ($attempt = 0; $attempt < 3 && !$dropped; $attempt++) {
+            $dropped = runMysqlSql('DROP DATABASE IF EXISTS ' . sqlIdentifier($schema), null, $errors);
+        }
+    }
+    if (!$dropped && !purgeSchema($schema)) return false;
+    if ($dropRequested && !$dropped) {
+        warn('Schema was emptied but could not be dropped: ' . $schema);
+        return false;
+    }
+    $ctx['tmp_db'] = null;
+    return true;
+}
+
 function cleanup(): void
 {
-    $c = &$GLOBALS['CTX'];
-    if ($c['cleaned']) return;
-    $c['cleaned'] = true;
-
-    if ($c['tmp_db'] && !$c['keep_temp'] && $c['defaults_file'] && is_file($c['defaults_file'])) {
-        // Guard: a DROP is never issued outside the temporary prefix.
-        if (strpos($c['tmp_db'], TMP_PREFIX) === 0) {
-            sh(mysqlCmd() . ' -e ' . escapeshellarg('DROP DATABASE IF EXISTS `' . $c['tmp_db'] . '`'));
-        }
-    }
-    foreach ($c['tmp_files'] as $f) {
-        if (is_file($f)) {
-            // Best-effort overwrite of the raw dump before unlinking.
-            $size = @filesize($f);
-            if ($size !== false && $size < 512 * 1024 * 1024) {
-                $fh = @fopen($f, 'r+');
-                if ($fh) { @ftruncate($fh, 0); @fclose($fh); }
+    $ctx = &$GLOBALS['CTX'];
+    if ($ctx['cleaned'] || $ctx['cleaning']) return;
+    $ctx['cleaning'] = true;
+    $ok = cleanupDatabase();
+    foreach (array_reverse(array_unique($ctx['tmp_files'])) as $file) {
+        if (!file_exists($file) && !is_link($file)) continue;
+        if (is_file($file)) {
+            $handle = @fopen($file, 'r+');
+            if ($handle) {
+                @ftruncate($handle, 0);
+                @fclose($handle);
             }
-            @unlink($f);
         }
+        if (!@unlink($file)) $ok = false;
     }
-    if ($c['defaults_file'] && is_file($c['defaults_file'])) @unlink($c['defaults_file']);
+    foreach (array_reverse(array_unique($ctx['tmp_dirs'])) as $dir) {
+        if (is_dir($dir) && !@rmdir($dir)) $ok = false;
+    }
+    if ($ctx['defaults_file'] && is_file($ctx['defaults_file'])) {
+        if (!@unlink($ctx['defaults_file'])) $ok = false;
+    }
+    $ctx['defaults_file'] = null;
+    $ctx['cleaning'] = false;
+    $ctx['cleaned'] = $ok;
+    if (!$ok) fwrite(STDERR, "\nCleanup incomplete; inspect the working schema and staging paths above.\n");
 }
 
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
 $opts = [
-        'path'       => getcwd(),
+        'path' => getcwd(),
         'output-dir' => getcwd() . '/anon-export',
-        'seed-file'  => null,
-        'unknown'    => null,
-        'config'     => null,
-        'dry-run'    => false,
-        'keep-temp'  => false,
+        'seed-file' => null,
+        'unknown' => null,
+        'config' => null,
+        'dry-run' => false,
+        'allow-unsafe-signals' => false,
 ];
+$valueOptions = ['path', 'output-dir', 'seed-file', 'unknown', 'config'];
 foreach (array_slice($argv, 1) as $arg) {
-    if ($arg === '--dry-run')       { $opts['dry-run']   = true; continue; }
-    if ($arg === '--keep-temp')     { $opts['keep-temp'] = true; continue; }
+    if ($arg === '--dry-run') { $opts['dry-run'] = true; continue; }
+    if ($arg === '--allow-unsafe-signals') { $opts['allow-unsafe-signals'] = true; continue; }
     if ($arg === '-h' || $arg === '--help') { usage(); exit(0); }
-    if (preg_match('/^--([a-z-]+)=(.*)$/', $arg, $m)) { $opts[$m[1]] = $m[2]; continue; }
+    if (preg_match('/^--([a-z-]+)=(.*)$/', $arg, $match) && in_array($match[1], $valueOptions, true)) {
+        $opts[$match[1]] = $match[2];
+        continue;
+    }
     fail('Unknown argument: ' . $arg);
 }
-$GLOBALS['CTX']['keep_temp'] = (bool)$opts['keep-temp'];
 
 if ($opts['unknown'] !== null && !in_array($opts['unknown'], ['schema', 'copy', 'exclude'], true)) {
     fail('--unknown accepts only: schema, copy, exclude');
 }
+
 $replay = [];
 if ($opts['config'] !== null) {
-    if (!is_file($opts['config'])) fail('Configuration file not found: ' . $opts['config']);
+    if (!is_file($opts['config']) || is_link($opts['config'])) fail('Configuration file not found or unsafe: ' . $opts['config']);
     $replay = json_decode((string)file_get_contents($opts['config']), true);
-    if (!is_array($replay)) fail('Invalid configuration file: ' . $opts['config']);
+    if (!is_array($replay) || ($replay['config_version'] ?? null) !== 1) {
+        fail('Unsupported or invalid configuration file: ' . $opts['config']);
+    }
 }
 
 function usage(): void
 {
     out("\n  shop-anonymizer v" . APP_VERSION . "\n" . <<<TXT
-
+Usage:
   php shop-anonymizer.php [options]
 
-  --path=DIR         WordPress installation root (default: current directory)
-  --output-dir=DIR   Output directory (default: ./anon-export)
-  --seed-file=FILE   File holding the pseudonymization seed
-  --unknown=ACTION   Apply the same action to EVERY unrecognized table without
-                     asking: schema | copy | exclude
-  --config=FILE      Reuse the choices from a previous run-config.json
-  --dry-run          Print the plan without creating anything or writing
-  --keep-temp        Keep the temporary schema (debugging only)
-
-TXT);
+  --path=DIR                 WordPress installation root (default: current directory)
+  --output-dir=DIR           Private output directory (default: ./anon-export)
+  --seed-file=FILE           64-hex-character pseudonymization seed
+  --unknown=ACTION           schema, copy or exclude for every unrecognized table
+  --config=FILE              Replay a version-1 run-config.json
+  --dry-run                  Read-only plan; writes only local run-config.json
+  --allow-unsafe-signals     Allow a real run without pcntl (unsafe, recorded)
+  -h, --help                 Show this help
+TXT
+    );
 }
-
 // ===========================================================================
 // 1. PREFLIGHT
 // ===========================================================================
-hr();
-out(c('  Shop Anonymizer ' . APP_VERSION . ' — anonymized export for test environments', 'bold'));
-out('  This script performs NO writes on the production database.');
-hr();
-
 step('Preflight');
+out('shop-anonymizer v' . APP_VERSION);
+warn('Run this tool only against a disposable workflow with a dedicated private output directory.');
 
-$wpBin = which('wp') ?? which('wp-cli') ?? which('wp-cli.phar');
+$wpBin = which('wp') ?: which('wp-cli') ?: which('wp-cli.phar');
 if (!$wpBin) fail('WP-CLI not found in PATH.');
-$mysqlBin = which('mysql') ?? which('mariadb');
-$dumpBin  = which('mysqldump') ?? which('mariadb-dump');
-if (!$mysqlBin) fail('mysql client not found in PATH.');
-if (!$dumpBin)  fail('mysqldump not found in PATH.');
+$mysqlBin = which('mysql') ?: which('mariadb');
+$dumpBin = which('mysqldump') ?: which('mariadb-dump');
+if (!$mysqlBin) fail('mysql/mariadb client not found in PATH.');
+if (!$dumpBin) fail('mysqldump/mariadb-dump not found in PATH.');
+if (!function_exists('gzopen')) fail('zlib extension not available in PHP CLI.');
 $GLOBALS['CTX']['mysql'] = $mysqlBin;
-if (!function_exists('gzopen')) fail('zlib extension not available in this PHP CLI.');
 ok('Binaries: wp, ' . basename($mysqlBin) . ', ' . basename($dumpBin));
 
-$wpPath = rtrim($opts['path'], '/');
-$GLOBALS['WP_PATH'] = $wpPath;
-if (!is_dir($wpPath)) fail('WordPress path does not exist: ' . $wpPath);
-// WP_CLI_PHP_ARGS silences PHP start-up warnings (extensions, deprecations):
-// without it they end up mixed into the values read from wp-config.php.
-$wp = "WP_CLI_PHP_ARGS='-d error_reporting=0 -d display_errors=0' "
-      . escapeshellarg($wpBin) . ' --path=' . escapeshellarg($wpPath) . ' --skip-plugins --skip-themes';
-
-$o = []; $e = [];
-if (sh($wp . ' core is-installed', $o, $e) !== 0) {
-    fail("No WordPress installation detected at {$wpPath}:\n" . diag(cleanOutput($o), $e));
+if (!$hasPcntl && !$opts['dry-run'] && !$opts['allow-unsafe-signals']) {
+    fail('pcntl is required for cleanup on SIGINT/SIGTERM. Use --allow-unsafe-signals only after accepting the risk.');
 }
-ok('WordPress installation detected at ' . $wpPath);
+if (!$hasPcntl && $opts['allow-unsafe-signals']) {
+    warn('Unsafe signal override active: interruption cleanup cannot be guaranteed.');
+}
+
+$wpPath = rtrim((string)$opts['path'], '/');
+$GLOBALS['WP_PATH'] = $wpPath;
+if (!is_dir($wpPath) || !is_file($wpPath . '/wp-includes/version.php')) {
+    fail('WordPress installation files not found in ' . $wpPath);
+}
+// These WP-CLI config commands run before WordPress bootstrap: no plugins, themes,
+// MU-plugins or drop-ins are loaded.
+$wp = "WP_CLI_PHP_ARGS='-d error_reporting=0 -d display_errors=0' "
+    . escapeshellarg($wpBin) . ' --path=' . escapeshellarg($wpPath)
+    . ' --skip-plugins --skip-themes';
 
 function wpConfigGet(string $wp, string $key, string $type = 'constant'): string
 {
-    $o = [];
-    if (sh($wp . ' config get ' . escapeshellarg($key) . ' --type=' . $type, $o) !== 0) {
-        return '';
+    $capture = sys_get_temp_dir() . '/anonwp_' . bin2hex(random_bytes(8));
+    createPrivateFile($capture);
+    $GLOBALS['CTX']['tmp_files'][] = $capture;
+    $output = [];
+    $errors = [];
+    $command = $wp . ' config get ' . escapeshellarg($key)
+        . ' --type=' . escapeshellarg($type) . ' > ' . escapeshellarg($capture);
+    if (sh($command, $output, $errors) !== 0) {
+        fail('Could not read ' . $key . " from wp-config.php:\n" . diag($output, $errors));
     }
-    $lines = cleanOutput($o);
-    if (!$lines) return '';
-    // Warnings always precede the value: the last usable line is the right one.
-    return trim((string)end($lines));
+    $value = @file_get_contents($capture);
+    if ($value === false) fail('Could not read private WP-CLI output for ' . $key . '.');
+    $handle = @fopen($capture, 'r+');
+    if ($handle) {
+        @ftruncate($handle, 0);
+        @fclose($handle);
+    }
+    if (!@unlink($capture)) fail('Could not remove private WP-CLI output for ' . $key . '.');
+    $GLOBALS['CTX']['tmp_files'] = array_values(array_diff($GLOBALS['CTX']['tmp_files'], [$capture]));
+    if (PHP_EOL !== '' && substr($value, -strlen(PHP_EOL)) === PHP_EOL) {
+        $value = substr($value, 0, -strlen(PHP_EOL));
+    }
+    return $value;
 }
 
 $db = [
-        'name'   => wpConfigGet($wp, 'DB_NAME'),
-        'user'   => wpConfigGet($wp, 'DB_USER'),
-        'pass'   => wpConfigGet($wp, 'DB_PASSWORD'),
-        'host'   => wpConfigGet($wp, 'DB_HOST') ?: 'localhost',
-        'prefix' => wpConfigGet($wp, 'table_prefix', 'variable') ?: 'wp_',
+        'name' => wpConfigGet($wp, 'DB_NAME'),
+        'user' => wpConfigGet($wp, 'DB_USER'),
+        'pass' => wpConfigGet($wp, 'DB_PASSWORD'),
+        'host' => wpConfigGet($wp, 'DB_HOST'),
+        'prefix' => wpConfigGet($wp, 'table_prefix', 'variable'),
 ];
-if ($db['name'] === '') fail('Could not read DB_NAME from wp-config.php.');
-foreach (['name' => 'DB_NAME', 'user' => 'DB_USER', 'host' => 'DB_HOST'] as $k => $label) {
-    if (preg_match('/^(PHP )?(Warning|Notice|Deprecated|Fatal)/i', $db[$k]) || preg_match('/\s/', $db[$k])) {
-        fail($label . " was read from wp-config.php in an unexpected form: \"" . $db[$k] . "\"\n"
-             . "  Most likely spurious PHP or WP-CLI output. Check it with:\n"
-             . "    wp config get " . $label . " --path=" . $GLOBALS['WP_PATH']);
-    }
+foreach (['name' => 'DB_NAME', 'user' => 'DB_USER', 'host' => 'DB_HOST'] as $key => $label) {
+    if ($db[$key] === '' || strpos($db[$key], "\0") !== false) fail('Invalid ' . $label . ' read from wp-config.php.');
+}
+if (strpos($db['pass'], "\0") !== false) fail('Invalid DB_PASSWORD read from wp-config.php.');
+if (!preg_match('/^[A-Za-z0-9_]+$/', $db['prefix'])) {
+    fail('table_prefix may contain only ASCII letters, digits and underscores.');
 }
 
-// DB_HOST may contain host:port or host:/path/to/socket
-$host = $db['host']; $port = ''; $socket = '';
-if (strpos($host, ':') !== false) {
-    [$host, $tail] = explode(':', $host, 2);
-    if (strpos($tail, '/') === 0) $socket = $tail; else $port = $tail;
+$hostSpec = $db['host'];
+$host = $hostSpec;
+$port = '';
+$socket = '';
+if (preg_match('/^\[([^]]+)\](?::([0-9]+))?$/', $hostSpec, $match)) {
+    $host = $match[1];
+    $port = $match[2] ?? '';
+} elseif (preg_match('/^([^:]+):(\/.*)$/', $hostSpec, $match)) {
+    $host = $match[1];
+    $socket = $match[2];
+} elseif (substr_count($hostSpec, ':') === 1) {
+    [$host, $port] = explode(':', $hostSpec, 2);
+    if ($port !== '' && !ctype_digit($port)) fail('Invalid DB_HOST port: ' . $port);
 }
 if ($host === '') $host = 'localhost';
 
-// Temporary credentials file: keeps the password off the command line (ps leak).
 $oldUmask = umask(0177);
 $defaultsFile = tempnam(sys_get_temp_dir(), 'anoncnf_');
-if ($defaultsFile === false) fail('Could not create the temporary credentials file.');
-$escape = function (string $v): string {
-    return '"' . str_replace(['\\', '"'], ['\\\\', '\\"'], $v) . '"';
-};
-$cnf  = "[client]\n";
-$cnf .= 'user=' . $escape($db['user']) . "\n";
-$cnf .= 'password=' . $escape($db['pass']) . "\n";
-$cnf .= 'host=' . $escape($host) . "\n";
-if ($port !== '')   $cnf .= 'port=' . (int)$port . "\n";
-if ($socket !== '') $cnf .= 'socket=' . $escape($socket) . "\n";
-file_put_contents($defaultsFile, $cnf);
-chmod($defaultsFile, 0600);
 umask($oldUmask);
+if ($defaultsFile === false) fail('Could not create temporary credentials file.');
 $GLOBALS['CTX']['defaults_file'] = $defaultsFile;
+$escapeCnf = function (string $value): string {
+    return '"' . str_replace(
+        ['\\', "\n", "\r", "\t", '"'],
+        ['\\\\', '\\n', '\\r', '\\t', '\\"'],
+        $value
+    ) . '"';
+};
+$cnf = "[client]\n"
+    . 'user=' . $escapeCnf($db['user']) . "\n"
+    . 'password=' . $escapeCnf($db['pass']) . "\n"
+    . 'host=' . $escapeCnf($host) . "\n";
+if ($port !== '') $cnf .= 'port=' . (int)$port . "\n";
+if ($socket !== '') $cnf .= 'socket=' . $escapeCnf($socket) . "\n";
+if (file_put_contents($defaultsFile, $cnf) !== strlen($cnf) || !@chmod($defaultsFile, 0600)) {
+    fail('Could not safely write the temporary MySQL credentials file.');
+}
 
-ok('DB connection: ' . $db['user'] . '@' . $host . ($port !== '' ? ':' . $port : '') . ($socket !== '' ? ' (socket ' . $socket . ')' : ''));
-$version        = qScalar('SELECT VERSION()');
+ok('DB connection: ' . $db['user'] . '@' . $host . ($port !== '' ? ':' . $port : ''));
+$version = qScalar('SELECT VERSION()');
 $versionComment = qScalar('SELECT @@version_comment');
-$isMariaDB      = stripos($version, 'mariadb') !== false || stripos($versionComment, 'mariadb') !== false;
-$isRDS          = str_has($host, '.rds.amazonaws.com');
-ok('Server: ' . $version . ($isMariaDB ? ' (MariaDB)' : '') . ($isRDS ? ' — Amazon RDS' : ''));
-ok('Source database: ' . $db['name'] . '  |  table prefix: ' . $db['prefix']);
+$isMariaDB = stripos($version, 'mariadb') !== false || stripos($versionComment, 'mariadb') !== false;
+ok('Server: ' . $version . ($isMariaDB ? ' (MariaDB)' : ''));
 
-// Data size and disk space
-$sizeRow  = q("SELECT COALESCE(SUM(data_length+index_length),0) FROM information_schema.tables WHERE table_schema = '" . addslashes($db['name']) . "'");
-$dataSize = (int)($sizeRow[0][0] ?? 0);
-ok('Estimated size: ' . fmtBytes($dataSize));
+$dataSize = (int)qScalar(
+    'SELECT COALESCE(SUM(data_length+index_length),0) FROM information_schema.tables WHERE table_schema='
+    . sqlString($db['name'])
+);
 
-function fmtBytes(int $b): string
+function fmtBytes(int $bytes): string
 {
-    $u = ['B', 'KB', 'MB', 'GB', 'TB'];
-    $i = 0;
-    $v = (float)$b;
-    while ($v >= 1024 && $i < count($u) - 1) { $v /= 1024; $i++; }
-    return sprintf('%.1f %s', $v, $u[$i]);
+    $units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    $value = (float)$bytes;
+    $index = 0;
+    while ($value >= 1024 && $index < count($units) - 1) {
+        $value /= 1024;
+        $index++;
+    }
+    return sprintf($index === 0 ? '%.0f %s' : '%.1f %s', $value, $units[$index]);
 }
-
-// CREATE DATABASE privilege: probed for real, not inferred from GRANTs
-$probeDb    = TMP_PREFIX . 'probe_' . bin2hex(random_bytes(3));
-$canCreate  = sh(mysqlCmd() . ' -e ' . escapeshellarg('CREATE DATABASE `' . $probeDb . '`')) === 0;
-if ($canCreate) {
-    sh(mysqlCmd() . ' -e ' . escapeshellarg('DROP DATABASE `' . $probeDb . '`'));
-    ok('The DB user can create temporary schemas');
-} else {
-    warn('The DB user cannot create schemas (typical on RDS with an application user).');
-    warn('An empty schema pre-created by your DBA will be required.');
-}
-
+ok('Source data size: ' . fmtBytes($dataSize));
 // ===========================================================================
 // 2. INVENTORY AND CLASSIFICATION
 // ===========================================================================
@@ -426,265 +649,334 @@ step('Table inventory');
 
 $p = $db['prefix'];
 $tables = [];
-foreach (q("SELECT table_name, COALESCE(table_rows,0), COALESCE(data_length+index_length,0)
-            FROM information_schema.tables
-            WHERE table_schema = '" . addslashes($db['name']) . "' AND table_type='BASE TABLE'
-            ORDER BY table_name") as $r) {
-    $tables[$r[0]] = ['rows' => (int)$r[1], 'size' => (int)$r[2]];
+foreach (q(
+    'SELECT table_name, COALESCE(table_rows,0), COALESCE(data_length+index_length,0) '
+    . 'FROM information_schema.tables WHERE table_schema=' . sqlString($db['name'])
+    . " AND table_type='BASE TABLE' ORDER BY table_name"
+) as $row) {
+    $tables[$row[0]] = ['rows' => (int)$row[1], 'size' => (int)$row[2]];
 }
-if (!$tables) fail('No tables found in the source database.');
+if (!$tables) fail('No base tables found in source database.');
 
 $columns = [];
-foreach (q("SELECT table_name, column_name FROM information_schema.columns
-            WHERE table_schema = '" . addslashes($db['name']) . "'") as $r) {
-    $columns[$r[0]][] = $r[1];
+foreach (q(
+    'SELECT table_name, column_name FROM information_schema.columns WHERE table_schema=' . sqlString($db['name'])
+) as $row) {
+    $columns[$row[0]][] = $row[1];
 }
-$hasTable = function (string $t) use ($tables): bool { return isset($tables[$t]); };
-$hasCol   = function (string $t, string $col) use ($columns): bool {
-    return isset($columns[$t]) && in_array($col, $columns[$t], true);
+$hasTable = function (string $table) use ($tables): bool { return isset($tables[$table]); };
+$hasCol = function (string $table, string $column) use ($columns): bool {
+    return isset($columns[$table]) && in_array($column, $columns[$table], true);
 };
 
-$hpos   = $hasTable($p . 'wc_orders');
+$hpos = $hasTable($p . 'wc_orders');
 $legacy = $hasTable($p . 'posts')
-          && (int)qScalar("SELECT EXISTS(SELECT 1 FROM `" . $p . "posts` WHERE post_type LIKE 'shop_order%')", $db['name'], '0') > 0;
-ok('Order storage: ' . ($hpos ? 'HPOS' : '') . ($hpos && $legacy ? ' + ' : '') . ($legacy ? 'legacy posts' : '') . (!$hpos && !$legacy ? 'no orders detected' : ''));
+    && (int)qScalar(
+        "SELECT EXISTS(SELECT 1 FROM " . sqlIdentifier($p . 'posts') . " WHERE post_type LIKE 'shop_order%')",
+        $db['name'],
+        '0'
+    ) > 0;
+ok('Order storage: ' . ($hpos ? 'HPOS' : '') . ($hpos && $legacy ? ' + ' : '')
+    . ($legacy ? 'legacy posts' : '') . (!$hpos && !$legacy ? 'no orders detected' : ''));
 
-/**
- * Actions: anonymize | copy | schema (structure only) | exclude
- */
-function classify(string $table, string $p): array
+/** Actions: anonymize | copy | schema (structure only) | exclude. */
+function classify(string $table, string $prefix): array
 {
-    $s = strpos($table, $p) === 0 ? substr($table, strlen($p)) : $table;
-
-    $anonymize = ['users', 'usermeta', 'posts', 'postmeta', 'comments', 'options',
-                  'wc_orders', 'wc_order_addresses', 'wc_orders_meta', 'wc_order_operational_data',
-                  'wc_customer_lookup', 'wc_download_log',
-                  'woocommerce_downloadable_product_permissions'];
-    $truncate  = ['woocommerce_sessions', 'woocommerce_payment_tokens', 'woocommerce_payment_tokenmeta',
-                  'woocommerce_api_keys', 'woocommerce_log', 'wc_admin_notes', 'wc_admin_note_actions',
-                  'wc_webhooks', 'wc_rate_limits', 'wc_reserved_stock',
-                  'actionscheduler_actions', 'actionscheduler_claims', 'actionscheduler_groups',
-                  'actionscheduler_logs', 'yoast_indexable', 'yoast_indexable_hierarchy',
-                  'yoast_seo_links', 'redirection_logs', 'redirection_404', 'wfhits', 'wflogins',
-                  'statistics_visitor', 'statistics_useronline'];
-    $copy      = ['commentmeta', 'terms', 'termmeta', 'term_taxonomy', 'term_relationships', 'links',
-                  'woocommerce_order_items', 'woocommerce_order_itemmeta', 'woocommerce_attribute_taxonomies',
-                  'woocommerce_tax_rates', 'woocommerce_tax_rate_locations', 'woocommerce_shipping_zones',
-                  'woocommerce_shipping_zone_locations', 'woocommerce_shipping_zone_methods',
-                  'wc_product_meta_lookup', 'wc_tax_rate_classes', 'wc_category_lookup',
-                  'wc_order_stats', 'wc_order_product_lookup', 'wc_order_tax_lookup', 'wc_order_coupon_lookup'];
-
-    if (in_array($s, $anonymize, true)) return ['anonymize', 'core table holding personal data'];
-    if (in_array($s, $truncate, true))  return ['schema', 'logs/sessions/secrets: structure only'];
-    if (in_array($s, $copy, true))      return ['copy', 'no personal data expected'];
-
-    return ['schema', c('UNRECOGNIZED TABLE', 'yellow') . ' — cautious default: structure only'];
+    $suffix = strpos($table, $prefix) === 0 ? substr($table, strlen($prefix)) : $table;
+    $anonymize = [
+        'users', 'usermeta', 'posts', 'postmeta', 'comments', 'commentmeta', 'options',
+        'wc_orders', 'wc_order_addresses', 'wc_orders_meta', 'wc_order_operational_data',
+        'wc_customer_lookup', 'wc_download_log', 'woocommerce_downloadable_product_permissions',
+        'woocommerce_order_itemmeta',
+    ];
+    $schemaOnly = [
+        'woocommerce_sessions', 'woocommerce_payment_tokens', 'woocommerce_payment_tokenmeta',
+        'woocommerce_api_keys', 'woocommerce_log', 'wc_admin_notes', 'wc_admin_note_actions',
+        'wc_webhooks', 'wc_rate_limits', 'wc_reserved_stock',
+        'actionscheduler_actions', 'actionscheduler_claims', 'actionscheduler_groups',
+        'actionscheduler_logs', 'yoast_indexable', 'yoast_indexable_hierarchy',
+        'yoast_seo_links', 'redirection_logs', 'redirection_404', 'wfhits', 'wflogins',
+        'statistics_visitor', 'statistics_useronline',
+    ];
+    $copy = [
+        'terms', 'termmeta', 'term_taxonomy', 'term_relationships', 'links',
+        'woocommerce_order_items', 'woocommerce_attribute_taxonomies',
+        'woocommerce_tax_rates', 'woocommerce_tax_rate_locations', 'woocommerce_shipping_zones',
+        'woocommerce_shipping_zone_locations', 'woocommerce_shipping_zone_methods',
+        'wc_product_meta_lookup', 'wc_tax_rate_classes', 'wc_category_lookup',
+        'wc_order_stats', 'wc_order_product_lookup', 'wc_order_tax_lookup', 'wc_order_coupon_lookup',
+    ];
+    if (in_array($suffix, $anonymize, true)) return ['anonymize', 'catalogued table requiring privacy rules'];
+    if (in_array($suffix, $schemaOnly, true)) return ['schema', 'logs, sessions or secrets: structure only'];
+    if (in_array($suffix, $copy, true)) return ['copy', 'catalogued structural or catalogue data'];
+    return ['schema', 'unrecognized table: cautious default'];
 }
 
 $plan = [];
-foreach ($tables as $t => $meta) {
-    [$action, $reason] = classify($t, $p);
-    $plan[$t] = ['action' => $action, 'reason' => $reason] + $meta;
+$unknown = [];
+foreach ($tables as $table => $stats) {
+    [$action, $reason] = classify($table, $p);
+    $plan[$table] = [
+        'action' => $action,
+        'reason' => $reason,
+        'rows' => $stats['rows'],
+        'size' => $stats['size'],
+    ];
+    if ($reason === 'unrecognized table: cautious default') $unknown[] = $table;
 }
-$unknown = array_keys(array_filter($plan, function ($v) { return str_has($v['reason'], 'UNRECOGNIZED'); }));
 
 out('');
-out('  ' . str_pad('TABLE', 42) . str_pad('ROWS', 10) . str_pad('SIZE', 10) . 'ACTION');
-foreach ($plan as $t => $v) {
-    $label = ['anonymize' => c('anonymize', 'green'), 'copy' => 'copy', 'schema' => c('structure only', 'yellow'), 'exclude' => c('excluded', 'red')][$v['action']];
-    out('  ' . str_pad($t, 42) . str_pad((string)$v['rows'], 10) . str_pad(fmtBytes($v['size']), 10) . $label);
+out(str_pad('TABLE', 42) . str_pad('ROWS', 10) . str_pad('SIZE', 10) . 'ACTION');
+foreach ($plan as $table => $item) {
+    $label = [
+        'anonymize' => c('anonymize', 'green'),
+        'copy' => 'copy',
+        'schema' => c('structure only', 'yellow'),
+        'exclude' => c('excluded', 'red'),
+    ][$item['action']];
+    out('  ' . str_pad($table, 42) . str_pad((string)$item['rows'], 10)
+        . str_pad(fmtBytes($item['size']), 10) . $label);
 }
-out('');
 ok(count($plan) . ' tables classified, ' . count($unknown) . ' unrecognized');
-
 // ===========================================================================
 // 3. WIZARD
 // ===========================================================================
 step('Export configuration');
 
-$outputDir = prompt('Output directory', $opts['output-dir']);
-if (!is_dir($outputDir) && !@mkdir($outputDir, 0700, true)) fail('Could not create ' . $outputDir);
+$outputDefault = (string)$opts['output-dir'];
+if ($outputDefault === getcwd() . '/anon-export' && isset($replay['output_dir'])) {
+    $outputDefault = (string)$replay['output_dir'];
+}
+$outputDir = prompt('Output directory', $outputDefault);
+ensurePrivateDirectory($outputDir);
 $free = disk_free_space($outputDir);
 $needed = (int)($dataSize * 2.5);
 if ($free !== false && $free < $needed) {
     warn('Free space ' . fmtBytes((int)$free) . ', estimated requirement ' . fmtBytes($needed) . '.');
     if (!confirm('Continue anyway?', false)) exit(0);
 } else {
-    ok('Available space: ' . fmtBytes((int)$free));
+    ok('Available space: ' . ($free === false ? 'unknown' : fmtBytes((int)$free)));
 }
 
-// --- Unrecognized tables
 $ACTIONS = ['schema', 'copy', 'exclude'];
-$LABELS  = ['Structure only (recommended)', 'Copy all data', 'Exclude entirely'];
+$LABELS = ['Structure only (recommended)', 'Copy all data', 'Exclude entirely'];
 
-/** Table family: the first segment after the WordPress prefix. */
-function family(string $table, string $p): string
+function family(string $table, string $prefix): string
 {
-    $s = strpos($table, $p) === 0 ? substr($table, strlen($p)) : $table;
-    $parts = explode('_', $s);
-    return count($parts) > 1 ? $parts[0] : $s;
+    $suffix = strpos($table, $prefix) === 0 ? substr($table, strlen($prefix)) : $table;
+    $parts = explode('_', $suffix);
+    return count($parts) > 1 ? $parts[0] : $suffix;
 }
 
-function applyAction(array &$plan, string $t, string $action, string $reason): void
+function applyAction(array &$plan, string $table, string $action, string $reason): void
 {
-    $plan[$t]['action'] = $action;
-    $plan[$t]['reason'] = $reason;
+    $plan[$table]['action'] = $action;
+    $plan[$table]['reason'] = $reason;
 }
 
 if ($unknown) {
-    // 1) Replay from a previous run-config: no questions for already-decided tables
-    $fromConfig = 0;
-    if (!empty($replay['table_actions'])) {
-        foreach ($unknown as $i => $t) {
-            $a = $replay['table_actions'][$t] ?? null;
-            if ($a !== null && in_array($a, $ACTIONS, true)) {
-                applyAction($plan, $t, $a, 'from run-config');
-                unset($unknown[$i]);
-                $fromConfig++;
-            }
+    $remaining = [];
+    foreach ($unknown as $table) {
+        $configured = $replay['table_actions'][$table] ?? null;
+        if (in_array($configured, $ACTIONS, true)) {
+            applyAction($plan, $table, $configured, 'run-config');
+        } else {
+            $remaining[] = $table;
         }
-        $unknown = array_values($unknown);
-        if ($fromConfig) ok($fromConfig . ' tables resolved from the supplied run-config');
     }
-
-    // 2) Action forced from the command line
-    if ($unknown && $opts['unknown'] !== null) {
-        foreach ($unknown as $t) applyAction($plan, $t, $opts['unknown'], '--unknown');
-        ok(count($unknown) . ' unrecognized tables set to "' . $opts['unknown'] . '" from the command line');
-        $unknown = [];
-    }
+    $unknown = $remaining;
 }
-
+if ($unknown && $opts['unknown'] !== null) {
+    foreach ($unknown as $table) applyAction($plan, $table, $opts['unknown'], '--unknown');
+    $unknown = [];
+}
 if ($unknown) {
     $groups = [];
-    foreach ($unknown as $t) $groups[family($t, $p)][] = $t;
+    foreach ($unknown as $table) $groups[family($table, $p)][] = $table;
     ksort($groups);
-
-    out('');
-    warn(count($unknown) . ' tables are not in the rule catalogue, across ' . count($groups) . ' groups.');
-    warn('The cautious default is to export their structure only: they may hold');
-    warn('personal data belonging to custom plugins.');
-    out('');
-    foreach ($groups as $g => $ts) {
-        $rows = array_sum(array_map(function ($t) use ($plan) { return $plan[$t]['rows']; }, $ts));
-        $size = array_sum(array_map(function ($t) use ($plan) { return $plan[$t]['size']; }, $ts));
-        out('    ' . c(str_pad($g . '_*', 24), 'bold') . str_pad(count($ts) . ' tables', 14)
-            . str_pad($rows . ' rows', 16) . fmtBytes($size));
+    warn(count($unknown) . ' unrecognized tables across ' . count($groups) . ' groups.');
+    foreach ($groups as $group => $groupTables) {
+        $rows = array_sum(array_map(function ($table) use ($plan) { return $plan[$table]['rows']; }, $groupTables));
+        out('  ' . str_pad($group . '_*', 28) . count($groupTables) . ' tables, ' . $rows . ' rows');
     }
-    out('');
-
-    $mode = choose('How do you want to proceed?', [
-            'Structure only for all of them (recommended, no further questions)',
-            'Exclude all of them',
-            'Decide per plugin group (' . count($groups) . ' questions)',
-            'Decide table by table (' . count($unknown) . ' questions)',
+    $mode = choose('How do you want to decide?', [
+        'Structure only for all (recommended)',
+        'Exclude all',
+        'Decide by plugin group',
+        'Decide table by table',
     ], 0);
-
     if ($mode === 0 || $mode === 1) {
-        $a = $mode === 0 ? 'schema' : 'exclude';
-        foreach ($unknown as $t) applyAction($plan, $t, $a, 'bulk choice');
-        ok(count($unknown) . ' tables set to "' . $a . '"');
-
+        $action = $mode === 0 ? 'schema' : 'exclude';
+        foreach ($unknown as $table) applyAction($plan, $table, $action, 'bulk choice');
     } elseif ($mode === 2) {
         $sticky = null;
-        foreach ($groups as $g => $ts) {
-            if ($sticky !== null) { foreach ($ts as $t) applyAction($plan, $t, $sticky, 'extended choice'); continue; }
-            $rows = array_sum(array_map(function ($t) use ($plan) { return $plan[$t]['rows']; }, $ts));
-            $r = chooseSticky(
-                    "\n  Group " . c($g . '_*', 'bold') . ' — ' . count($ts) . ' tables, ' . $rows . ' rows'
-                    . "\n    " . implode(', ', array_slice($ts, 0, 6)) . (count($ts) > 6 ? ', …' : ''),
-                    $LABELS, 0
-            );
-            $a = $ACTIONS[$r['index']];
-            foreach ($ts as $t) applyAction($plan, $t, $a, 'group choice');
-            if ($r['all']) { $sticky = $a; ok('Choice "' . $a . '" applied to every remaining group as well'); }
+        foreach ($groups as $group => $groupTables) {
+            if ($sticky === null) {
+                $answer = chooseSticky($group . '_*', $LABELS, 0);
+                $action = $ACTIONS[$answer['index']];
+                if ($answer['all']) $sticky = $action;
+            } else {
+                $action = $sticky;
+            }
+            foreach ($groupTables as $table) applyAction($plan, $table, $action, 'operator group choice');
         }
-
     } else {
         $sticky = null;
-        foreach ($unknown as $t) {
-            if ($sticky !== null) { applyAction($plan, $t, $sticky, 'extended choice'); continue; }
-            $r = chooseSticky(
-                    "\n  Table " . c($t, 'bold') . ' (' . $plan[$t]['rows'] . ' rows, ' . fmtBytes($plan[$t]['size']) . ')',
-                    $LABELS, 0
-            );
-            $a = $ACTIONS[$r['index']];
-            applyAction($plan, $t, $a, 'operator choice');
-            if ($r['all']) { $sticky = $a; ok('Choice "' . $a . '" applied to every remaining table as well'); }
+        foreach ($unknown as $table) {
+            if ($sticky === null) {
+                $answer = chooseSticky($table . ' (' . $plan[$table]['rows'] . ' rows)', $LABELS, 0);
+                $action = $ACTIONS[$answer['index']];
+                if ($answer['all']) $sticky = $action;
+            } else {
+                $action = $sticky;
+            }
+            applyAction($plan, $table, $action, 'operator table choice');
         }
     }
+}
+$copiedUnknown = array_keys(array_filter($plan, function ($item) {
+    return $item['action'] === 'copy' && strpos($item['reason'], 'choice') !== false;
+}));
+if ($copiedUnknown) warn('Unrecognized tables copied with data: ' . implode(', ', $copiedUnknown));
 
-    // Recap of the tables that keep their data, so risky choices get a second look
-    $copied = array_keys(array_filter($plan, function ($v) { return $v['action'] === 'copy' && str_has($v['reason'], 'choice'); }));
-    if ($copied) {
-        out('');
-        warn('Copied in full by explicit choice: ' . implode(', ', $copied));
+// Discover suspicious EAV keys without printing their values.
+$residualScopes = [];
+foreach ([
+    'usermeta' => [$p . 'usermeta', 'meta_key', 'meta_value'],
+    'postmeta' => [$p . 'postmeta', 'meta_key', 'meta_value'],
+    'hpos_order_meta' => [$p . 'wc_orders_meta', 'meta_key', 'meta_value'],
+    'order_itemmeta' => [$p . 'woocommerce_order_itemmeta', 'meta_key', 'meta_value'],
+    'commentmeta' => [$p . 'commentmeta', 'meta_key', 'meta_value'],
+    'options' => [$p . 'options', 'option_name', 'option_value'],
+] as $scope => $definition) {
+    if ($hasTable($definition[0]) && ($plan[$definition[0]]['action'] ?? '') === 'anonymize') {
+        $residualScopes[$scope] = $definition;
+    }
+}
+function handledResidualKey(string $scope, string $key): bool
+{
+    $lower = strtolower($key);
+    if ($scope === 'usermeta') {
+        if (in_array($lower, ['session_tokens', '_new_email', '_password_reset_key', '_application_passwords',
+            'first_name', 'last_name', 'nickname', 'billing_email', 'shipping_email', 'billing_phone',
+            'shipping_phone', 'billing_address_1', 'shipping_address_1', 'billing_address_2',
+            'shipping_address_2', 'billing_company', 'shipping_company', 'description',
+            'billing_city', 'shipping_city', 'billing_postcode', 'shipping_postcode'], true)) return true;
+        if (preg_match('/(vat|codice_fiscale|piva|(^|_)cf$)/', $lower)) return true;
+    }
+    if ($scope === 'postmeta') {
+        if (in_array($lower, [
+            '_billing_first_name', '_shipping_first_name', '_billing_last_name', '_shipping_last_name',
+            '_billing_email', '_shipping_email', '_billing_phone', '_shipping_phone',
+            '_billing_address_1', '_shipping_address_1', '_billing_address_2', '_shipping_address_2',
+            '_billing_company', '_shipping_company', '_billing_city', '_shipping_city',
+            '_billing_postcode', '_shipping_postcode', '_customer_user_agent', '_customer_note',
+            '_customer_ip_address', '_transaction_id', '_order_key', '_payment_tokens',
+            '_stripe_customer_id', '_stripe_source_id', '_paypal_transaction_id',
+        ], true)) return true;
+        if (preg_match('/(token|secret|api_key|vat|codice_fiscale|piva|(^|_)cf$)/', $lower)) return true;
+    }
+    if ($scope === 'hpos_order_meta' && preg_match('/(token|secret|api_key|customer_id|vat|codice_fiscale|piva)/', $lower)) return true;
+    if ($scope === 'commentmeta' && strpos($lower, 'akismet_') === 0) return true;
+    if ($scope === 'options' && (strpos($lower, '_transient_') === 0
+        || preg_match('/(api.?key|secret|password|passwd|private.?key|token|smtp|mailgun|sendgrid|license|stripe|paypal|braintree|nexi|satispay|recaptcha|aws_)/', $lower))) return true;
+    return false;
+}
+
+$residualCandidates = [];
+$keyPattern = '(email|e_mail|phone|mobile|address|company|vat|piva|codice_fiscale|(^|_)cf($|_)|token|secret|password|passwd|api_key|(^|_)ip($|_)|user_agent|customer_note)';
+$emailPattern = '[[:alnum:]._%+-]+@[[:alnum:].-]+[.][[:alpha:]]{2,}';
+$ipPattern = '([0-9]{1,3}[.]){3}[0-9]{1,3}';
+foreach ($residualScopes as $scope => $definition) {
+    [$table, $keyColumn, $valueColumn] = $definition;
+    $sql = 'SELECT HEX(' . sqlIdentifier($keyColumn) . '), COUNT(*) FROM ' . sqlIdentifier($table)
+        . ' WHERE LOWER(' . sqlIdentifier($keyColumn) . ') REGEXP ' . sqlString($keyPattern)
+        . ' OR ' . sqlIdentifier($valueColumn) . ' REGEXP ' . sqlString($emailPattern)
+        . ' OR ' . sqlIdentifier($valueColumn) . ' REGEXP ' . sqlString($ipPattern)
+        . ' GROUP BY ' . sqlIdentifier($keyColumn) . ' ORDER BY ' . sqlIdentifier($keyColumn);
+    foreach (q($sql, $db['name']) as $row) {
+        $keyHex = (string)$row[0];
+        $key = hex2bin($keyHex);
+        if ($key === false) fail('Could not decode a metadata key returned by MySQL.');
+        if (handledResidualKey($scope, $key)) continue;
+        $residualCandidates[] = [
+            'scope' => $scope, 'table' => $table, 'key_column' => $keyColumn,
+            'value_column' => $valueColumn, 'key' => $key, 'rows' => (int)$row[1],
+        ];
     }
 }
 
-// --- Time-based subsetting
-$monthsBack = 0;
-$cfgMonths  = isset($replay['months_back']) ? (int)$replay['months_back'] : 0;
-if ($hpos || $legacy) {
-    if (confirm("\n  Limit the export to the most recent orders?", $cfgMonths > 0)) {
-        $monthsBack = (int)prompt('Months to keep', (string)($cfgMonths > 0 ? $cfgMonths : 12));
-        if ($monthsBack < 1) $monthsBack = 0;
-    }
-}
-
-// --- Service administrator account
-$serviceAdmin = null;
-if (confirm("\n  Create a service administrator account in the dump?",
-        array_key_exists('service_admin_login', $replay) ? $replay['service_admin_login'] !== null : true)) {
-    // Randomized on every run: a predictable service login on a shared test
-    // environment is a standing invitation.
-    $login = prompt('Login', 'admin_test_' . bin2hex(random_bytes(2)));
-    $pass  = prompt('Password', 'anon-' . bin2hex(random_bytes(4)));
-    $o = [];
-    // wp eval is read-only here: it only computes the hash with the algorithm of this install.
-    $hash = '';
-    if (sh($wp . ' eval ' . escapeshellarg('echo wp_hash_password("' . addslashes($pass) . '");'), $o) === 0) {
-        $lines = cleanOutput($o);
-        $hash  = $lines ? trim((string)end($lines)) : '';
-    }
-    if ($hash === '' || strlen($hash) < 20) {
-        warn('Could not compute the password hash: the service account will not be created.');
+$residualActions = [];
+$residualExceptions = [];
+$stickyResidual = null;
+foreach ($residualCandidates as $candidate) {
+    $scope = $candidate['scope'];
+    $key = $candidate['key'];
+    $configured = $replay['residual_actions'][$scope][$key] ?? null;
+    if (in_array($configured, ['redact', 'preserve'], true)) {
+        $action = $configured;
+    } elseif ($stickyResidual !== null) {
+        $action = $stickyResidual;
     } else {
-        $serviceAdmin = ['login' => $login, 'pass' => $pass, 'hash' => $hash];
-        ok('Hash computed with the algorithm of this installation');
+        $answer = chooseSticky(
+            'Suspicious metadata ' . $scope . ':' . $key . ' (' . $candidate['rows'] . ' rows; values hidden)',
+            ['Redact values (recommended)', 'Preserve values and record exception'],
+            0
+        );
+        $action = $answer['index'] === 0 ? 'redact' : 'preserve';
+        if ($answer['all']) $stickyResidual = $action;
     }
+    $residualActions[$scope][$key] = $action;
+    if ($action === 'preserve') $residualExceptions[] = $candidate;
+}
+if ($residualCandidates) ok(count($residualCandidates) . ' suspicious metadata keys reviewed.');
+
+$monthsBack = 0;
+$configuredMonths = isset($replay['months_back']) ? (int)$replay['months_back'] : 0;
+if (($hpos || $legacy) && confirm("\nLimit export to recent orders?", $configuredMonths > 0)) {
+    $monthsBack = max(0, (int)prompt('Months to keep', (string)($configuredMonths > 0 ? $configuredMonths : 12)));
 }
 
-// --- Media library
-$keepAttachments = confirm("\n  Keep the media library records (attachments)?",
-        isset($replay['keep_attachments']) ? (bool)$replay['keep_attachments'] : true);
+$createServiceAdmin = confirm(
+    "\nCreate a service administrator account?",
+    isset($replay['create_service_admin']) ? (bool)$replay['create_service_admin'] : false
+);
+$keepAttachments = confirm(
+    "\nKeep media-library attachment records? They may contain PII/EXIF.",
+    isset($replay['keep_attachments']) ? (bool)$replay['keep_attachments'] : true
+);
+if ($keepAttachments) warn('Attachment records are retained and will be recorded as a privacy exception.');
 
-// --- Persistent seed
-$seedFile = $opts['seed-file'] ?: $outputDir . '/.anon-seed';
-if (is_file($seedFile)) {
-    $seed = trim((string)file_get_contents($seedFile));
-    ok('Existing seed reused: fake values will match the previous exports');
-} else {
-    $seed = bin2hex(random_bytes(32));
-    $old = umask(0177);
-    file_put_contents($seedFile, $seed);
-    chmod($seedFile, 0600);
-    umask($old);
-    ok('New seed generated in ' . $seedFile);
+$configuredFreeText = $replay['free_text_action'] ?? 'redact';
+$freeTextAction = ['redact', 'preserve'][choose(
+    "\nProduct reviews and other free-text comments:",
+    ['Redact bodies (recommended)', 'Preserve bodies and record exception'],
+    $configuredFreeText === 'preserve' ? 1 : 0
+)];
+if ($freeTextAction === 'preserve') {
+    $residualExceptions[] = ['scope' => 'comment_text', 'key' => 'comment_content', 'rows' => -1];
 }
-warn('The seed makes the transformation deterministic: keep it as a secret');
-warn('and do NOT hand it over together with the dump.');
 
-// --- Temporary schema
-$stamp = date('Ymd-His');
-if ($canCreate) {
-    $tmpDb = TMP_PREFIX . preg_replace('/[^a-z0-9_]/i', '_', substr($db['name'], 0, 24)) . '_' . date('YmdHis');
-} else {
-    out('');
-    $tmpDb = prompt('Name of the empty schema already prepared (must start with ' . TMP_PREFIX . ')');
-}
-if (strpos($tmpDb, TMP_PREFIX) !== 0) fail('The working schema must start with "' . TMP_PREFIX . '".');
-if (strtolower($tmpDb) === strtolower($db['name'])) fail('The working schema matches the production database. Aborted.');
+$preparedCleanup = in_array($replay['prepared_schema_cleanup'] ?? '', ['empty', 'drop'], true)
+    ? $replay['prepared_schema_cleanup']
+    : 'empty';
+
+$buildRunConfig = function () use (
+    &$outputDir, &$monthsBack, &$keepAttachments, &$createServiceAdmin, &$preparedCleanup,
+    &$freeTextAction, &$plan, &$residualActions
+): array {
+    return [
+        'config_version' => 1,
+        'output_dir' => $outputDir,
+        'months_back' => $monthsBack,
+        'keep_attachments' => $keepAttachments,
+        'create_service_admin' => $createServiceAdmin,
+        'prepared_schema_cleanup' => $preparedCleanup,
+        'free_text_action' => $freeTextAction,
+        'table_actions' => array_map(function ($item) { return $item['action']; }, $plan),
+        'residual_actions' => $residualActions,
+    ];
+};
 
 // ===========================================================================
 // 4. SUMMARY AND CONFIRMATION
@@ -692,113 +984,192 @@ if (strtolower($tmpDb) === strtolower($db['name'])) fail('The working schema mat
 $counts = array_count_values(array_column($plan, 'action'));
 step('Summary');
 hr();
-out('  Source (read-only)  : ' . $db['name'] . ' @ ' . $host);
-out('  Working schema      : ' . $tmpDb . ($canCreate ? ' (created, then dropped)' : ' (pre-existing, will be emptied)'));
-out('  Output              : ' . $outputDir);
-out('  Tables              : ' . ($counts['anonymize'] ?? 0) . ' anonymized, '
-    . ($counts['copy'] ?? 0) . ' copied, '
-    . ($counts['schema'] ?? 0) . ' structure only, '
+out('  Source (read-only) : ' . $db['name'] . ' @ ' . $host);
+out('  Working schema     : automatic private schema, or operator-supplied empty schema');
+out('  Output             : ' . $outputDir);
+out('  Tables             : ' . ($counts['anonymize'] ?? 0) . ' anonymized, '
+    . ($counts['copy'] ?? 0) . ' copied, ' . ($counts['schema'] ?? 0) . ' structure only, '
     . ($counts['exclude'] ?? 0) . ' excluded');
-out('  Orders              : ' . ($monthsBack ? 'last ' . $monthsBack . ' months' : 'all'));
-out('  Media library       : ' . ($keepAttachments ? 'kept' : 'removed'));
-out('  Service account     : ' . ($serviceAdmin ? $serviceAdmin['login'] . ' / ' . $serviceAdmin['pass'] : 'none'));
-out('  Mode                : ' . ($opts['dry-run'] ? c('DRY-RUN (no writes)', 'yellow') : 'full run'));
-hr();
-out('  ' . c('No write statement will be sent to ' . $db['name'] . '.', 'green'));
+out('  Orders             : ' . ($monthsBack ? 'last ' . $monthsBack . ' months' : 'all'));
+out('  Attachments        : ' . ($keepAttachments ? 'kept (exception)' : 'removed with related rows'));
+out('  Free text          : ' . $freeTextAction);
+out('  Service account    : ' . ($createServiceAdmin ? 'created after confirmation' : 'none'));
+out('  Suspicious keys    : ' . count($residualCandidates) . ' reviewed, '
+    . count($residualExceptions) . ' preserved exceptions');
+out('  Mode               : ' . ($opts['dry-run'] ? c('DRY-RUN (database read-only)', 'yellow') : 'full run'));
 hr();
 
 if ($opts['dry-run']) {
-    $dryCfg = [
-            'output_dir' => $outputDir, 'months_back' => $monthsBack, 'keep_attachments' => $keepAttachments,
-            'service_admin_login' => $serviceAdmin['login'] ?? null,
-            'table_actions' => array_map(function ($v) { return $v['action']; }, $plan),
-    ];
     $dryFile = $outputDir . '/run-config.json';
-    file_put_contents($dryFile, json_encode($dryCfg, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-    out("\n  Dry-run complete. No schema touched, no dump produced.");
-    out('  Choices saved to ' . $dryFile . ' — reuse them with:');
-    out('    php shop-anonymizer.php --path=... --config=' . $dryFile . "\n");
+    writePrivateFile($dryFile, encodeJsonOrFail($buildRunConfig(), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
+    out("\nDry-run complete: no database schema was created or modified.");
+    out('Local configuration written with mode 0600: ' . $dryFile);
     exit(0);
 }
 
-if (strtoupper(prompt("\n  Type " . c('ANONYMIZE', 'bold') . ' to proceed')) !== 'ANONYMIZE') {
-    out('  Cancelled.');
+if ($residualExceptions) {
+    warn('Preserved residual-risk choices will make the export verified_with_exceptions.');
+    if (prompt('Type ACCEPT RESIDUAL RISK to confirm these exceptions') !== 'ACCEPT RESIDUAL RISK') {
+        out('Cancelled.');
+        exit(0);
+    }
+}
+if (strtoupper(prompt("\nType " . c('ANONYMIZE', 'bold') . ' to proceed')) !== 'ANONYMIZE') {
+    out('Cancelled.');
     exit(0);
 }
 
+$runId = date('Ymd-His') . '-' . bin2hex(random_bytes(4));
+$automaticSchema = TMP_PREFIX
+    . substr(preg_replace('/[^A-Za-z0-9_]/', '_', $db['name']), 0, 24)
+    . '_' . substr(str_replace('-', '', $runId), -16);
+$automaticSchema = substr($automaticSchema, 0, 64);
+assertTempSchemaName($automaticSchema);
+$GLOBALS['CTX']['tmp_db'] = $automaticSchema;
+$GLOBALS['CTX']['tmp_db_owned'] = true;
+$schemaErrors = [];
+if (runMysqlSql(
+    'CREATE DATABASE ' . sqlIdentifier($automaticSchema) . ' CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci',
+    null,
+    $schemaErrors
+)) {
+    $tmpDb = $automaticSchema;
+    ok('Created private working schema ' . $tmpDb);
+} else {
+    $GLOBALS['CTX']['tmp_db'] = null;
+    $GLOBALS['CTX']['tmp_db_owned'] = false;
+    warn('Automatic schema creation unavailable; an empty DBA-prepared schema is required.');
+    $tmpDb = prompt('Prepared schema name (must start ' . TMP_PREFIX . ')');
+    assertTempSchemaName($tmpDb);
+    if (strtolower($tmpDb) === strtolower($db['name'])) fail('Working schema matches source database.');
+    $exists = (int)qScalar(
+        'SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name=' . sqlString($tmpDb),
+        null,
+        '0'
+    );
+    $objects = (int)qScalar(
+        'SELECT '
+        . '(SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=' . sqlString($tmpDb) . ') + '
+        . '(SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema=' . sqlString($tmpDb) . ') + '
+        . '(SELECT COUNT(*) FROM information_schema.events WHERE event_schema=' . sqlString($tmpDb) . ')',
+        null,
+        '0'
+    );
+    if ($exists !== 1 || $objects !== 0) {
+        fail('Prepared schema must exist and contain no tables, views, routines or events.');
+    }
+    $preparedCleanup = ['empty', 'drop'][choose(
+        'After the run, keep the prepared schema empty or drop it?',
+        ['Keep it empty (recommended)', 'Drop the schema'],
+        $preparedCleanup === 'drop' ? 1 : 0
+    )];
+    $GLOBALS['CTX']['tmp_db'] = $tmpDb;
+    $GLOBALS['CTX']['prepared_cleanup'] = $preparedCleanup;
+}
+if (strtolower($tmpDb) === strtolower($db['name'])) fail('Working schema matches source database.');
+
+$stageDir = $outputDir . '/.staging-' . $runId;
+ensurePrivateDirectory($stageDir);
+$GLOBALS['CTX']['tmp_dirs'][] = $stageDir;
+
+$seedFile = $opts['seed-file'] ?: $outputDir . '/.anon-seed';
+$newSeed = false;
+if (is_file($seedFile) && !is_link($seedFile)) {
+    $seed = trim((string)file_get_contents($seedFile));
+    if (!preg_match('/^[a-fA-F0-9]{64}$/', $seed)) fail('Seed file must contain exactly 64 hexadecimal characters.');
+    if (!@chmod($seedFile, 0600)) fail('Could not restrict seed permissions.');
+    ok('Existing seed reused.');
+} elseif (file_exists($seedFile) || is_link($seedFile)) {
+    fail('Seed path is not a safe regular file: ' . $seedFile);
+} else {
+    $seed = bin2hex(random_bytes(32));
+    writePrivateFile($seedFile, $seed . "\n");
+    $GLOBALS['CTX']['tmp_files'][] = $seedFile;
+    $newSeed = true;
+    ok('New private seed generated.');
+}
+
+$serviceAdmin = null;
+if ($createServiceAdmin) {
+    $passwordClass = $wpPath . '/wp-includes/class-phpass.php';
+    if (!is_file($passwordClass)) fail('WordPress PasswordHash implementation not found.');
+    require_once $passwordClass;
+    if (!class_exists('PasswordHash')) fail('WordPress PasswordHash class could not be loaded.');
+    $password = 'anon-' . rtrim(strtr(base64_encode(random_bytes(18)), '+/', '-_'), '=');
+    $login = 'admin_test_' . bin2hex(random_bytes(4));
+    $hasher = new PasswordHash(8, true);
+    $hash = $hasher->HashPassword($password);
+    if (!is_string($hash) || strlen($hash) < 20) fail('Could not generate WordPress-compatible password hash.');
+    $serviceAdmin = ['login' => $login, 'pass' => $password, 'hash' => $hash];
+}
 // ===========================================================================
 // 5. READ-ONLY EXTRACTION
 // ===========================================================================
-step('Extraction from the production database (read-only)');
+step('Extraction from source database (read-only)');
 
-$dumpFlags = ['--single-transaction', '--quick', '--skip-lock-tables', '--default-character-set=utf8mb4', '--hex-blob'];
-$helpOut = [];
-sh(escapeshellarg($dumpBin) . ' --help', $helpOut);
-$help = implode("\n", $helpOut);
-if (str_has($help, 'no-tablespaces'))    $dumpFlags[] = '--no-tablespaces';
-if (str_has($help, 'set-gtid-purged'))   $dumpFlags[] = '--set-gtid-purged=OFF';
-if (str_has($help, 'column-statistics')) $dumpFlags[] = '--column-statistics=0';
+$dumpFlags = [
+    '--single-transaction', '--quick', '--skip-lock-tables',
+    '--default-character-set=utf8mb4', '--hex-blob', '--skip-triggers',
+];
+$helpOutput = [];
+sh(escapeshellarg($dumpBin) . ' --help', $helpOutput);
+$dumpHelp = implode("\n", $helpOutput);
+if (str_has($dumpHelp, 'no-tablespaces')) $dumpFlags[] = '--no-tablespaces';
+if (str_has($dumpHelp, 'set-gtid-purged')) $dumpFlags[] = '--set-gtid-purged=OFF';
+if (str_has($dumpHelp, 'column-statistics')) $dumpFlags[] = '--column-statistics=0';
 
-$withData   = [];
+$withData = [];
 $schemaOnly = [];
-foreach ($plan as $t => $v) {
-    if ($v['action'] === 'exclude') continue;
-    if ($v['action'] === 'schema') $schemaOnly[] = $t; else $withData[] = $t;
+foreach ($plan as $table => $item) {
+    if ($item['action'] === 'exclude') continue;
+    if ($item['action'] === 'schema') $schemaOnly[] = $table;
+    else $withData[] = $table;
 }
+if (!$withData) fail('Refusing an extraction with no data-bearing tables.');
 
-$e = [];
-$rawDump = $outputDir . '/.raw-' . $stamp . '.sql';
+$baseDump = escapeshellarg($dumpBin)
+    . ' --defaults-extra-file=' . escapeshellarg($defaultsFile)
+    . ' ' . implode(' ', $dumpFlags);
+$rawDump = $stageDir . '/raw.sql';
+createPrivateFile($rawDump);
 $GLOBALS['CTX']['tmp_files'][] = $rawDump;
-$old = umask(0177);
-touch($rawDump);
-chmod($rawDump, 0600);
-umask($old);
 
-$base = escapeshellarg($dumpBin) . ' --defaults-extra-file=' . escapeshellarg($defaultsFile) . ' ' . implode(' ', $dumpFlags);
-
-$cmd1 = $base . ' ' . escapeshellarg($db['name']) . ' ' . implode(' ', array_map('escapeshellarg', $withData))
-        . ' > ' . escapeshellarg($rawDump);
-$o = [];
-if (sh($cmd1, $o, $e) !== 0) fail("mysqldump failed:\n" . diag($o, $e));
-ok(count($withData) . ' tables extracted with data');
+$command = $baseDump . ' ' . escapeshellarg($db['name']) . ' '
+    . implode(' ', array_map('escapeshellarg', $withData))
+    . ' > ' . escapeshellarg($rawDump);
+$output = [];
+$errors = [];
+if (sh($command, $output, $errors) !== 0) fail("mysqldump failed:\n" . diag($output, $errors));
+ok(count($withData) . ' tables extracted with data.');
 
 if ($schemaOnly) {
-    $cmd2 = $base . ' --no-data ' . escapeshellarg($db['name']) . ' ' . implode(' ', array_map('escapeshellarg', $schemaOnly))
-            . ' >> ' . escapeshellarg($rawDump);
-    if (sh($cmd2, $o, $e) !== 0) fail("mysqldump (structure only) failed:\n" . diag($o, $e));
-    ok(count($schemaOnly) . ' tables extracted without data');
+    $command = $baseDump . ' --no-data ' . escapeshellarg($db['name']) . ' '
+        . implode(' ', array_map('escapeshellarg', $schemaOnly))
+        . ' >> ' . escapeshellarg($rawDump);
+    if (sh($command, $output, $errors) !== 0) fail("mysqldump structure-only pass failed:\n" . diag($output, $errors));
+    ok(count($schemaOnly) . ' tables extracted without data.');
 }
-ok('Raw dump: ' . fmtBytes((int)filesize($rawDump)) . ' (temporary, will be removed)');
+if (!is_file($rawDump) || filesize($rawDump) === 0) fail('Source dump is empty.');
 
 // ===========================================================================
 // 6. TEMPORARY SCHEMA
 // ===========================================================================
-step('Loading into the temporary schema');
-
-if ($canCreate) {
-    $o = [];
-    if (sh(mysqlCmd() . ' -e ' . escapeshellarg('CREATE DATABASE `' . $tmpDb . '` CHARACTER SET utf8mb4'), $o, $e) !== 0) {
-        fail("Temporary schema creation failed:\n" . diag($o, $e));
-    }
-} else {
-    $exists = (int)qScalar("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='" . addslashes($tmpDb) . "'", null, '0');
-    if ($exists === 0) fail('Schema ' . $tmpDb . ' does not exist or is not visible to this user.');
-    $n = (int)qScalar("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='" . addslashes($tmpDb) . "'", null, '0');
-    if ($n > 0)  fail('Schema ' . $tmpDb . ' already holds ' . $n . ' tables: please supply an empty one.');
-}
-$GLOBALS['CTX']['tmp_db'] = $tmpDb;
-
-$o = [];
-if (sh(mysqlCmd($tmpDb) . ' < ' . escapeshellarg($rawDump), $o, $e) !== 0) {
-    fail("Import into the temporary schema failed:\n" . diag($o, $e));
+step('Loading into temporary schema');
+$output = [];
+$errors = [];
+if (sh(mysqlCmd($tmpDb) . ' < ' . escapeshellarg($rawDump), $output, $errors) !== 0) {
+    fail("Import into temporary schema failed:\n" . diag($output, $errors));
 }
 ok('Import completed into ' . $tmpDb);
 
-// The raw dump holding real data is no longer needed: remove it right away.
-$fh = @fopen($rawDump, 'r+'); if ($fh) { ftruncate($fh, 0); fclose($fh); }
-@unlink($rawDump);
-ok('Raw dump removed');
-
+$rawHandle = @fopen($rawDump, 'r+');
+if ($rawHandle) {
+    @ftruncate($rawHandle, 0);
+    @fclose($rawHandle);
+}
+if (!@unlink($rawDump)) fail('Could not remove raw source dump.');
+$GLOBALS['CTX']['tmp_files'] = array_values(array_diff($GLOBALS['CTX']['tmp_files'], [$rawDump]));
+ok('Raw source dump removed.');
 // ===========================================================================
 // 7. ANONYMIZATION SQL GENERATION
 // ===========================================================================
@@ -822,372 +1193,837 @@ $streets    = ['Garibaldi','Roma','Verdi','Dante','Manzoni','Mazzini','Cavour','
                'Diaz','Petrarca','Boccaccio','Galilei','Volta','Fermi','Torino','Firenze','Napoli','Bologna',
                'Carducci','Pascoli'];
 
-$sqlFile = $outputDir . '/.anon-' . $stamp . '.sql';
-$GLOBALS['CTX']['tmp_files'][] = $sqlFile;
-$sql = [];
+$sqlFile = $stageDir . '/anonymize.sql';
+$sql = [
+    'SET NAMES utf8mb4;',
+    "SET SESSION sql_mode='STRICT_ALL_TABLES';",
+    "SET @seed := UNHEX('" . strtolower($seed) . "');",
+    'SET @guard := IF(DATABASE()=' . sqlString($tmpDb) . ', 1, NULL);',
+    'CREATE TEMPORARY TABLE _anon_guard (ok INT NOT NULL);',
+    'INSERT INTO _anon_guard (ok) VALUES (@guard);',
+    'DROP TEMPORARY TABLE _anon_guard;',
+    'SET FOREIGN_KEY_CHECKS=0;',
+];
 
-// --- Guard: fails hard if the active schema is not the temporary one
-$sql[] = "SET NAMES utf8mb4;";
-$sql[] = "SET SESSION sql_mode='STRICT_ALL_TABLES';";
-$sql[] = "SET @seed := '" . $seed . "';";
-$sql[] = "SET @guard := (SELECT IF(DATABASE() LIKE '" . TMP_PREFIX . "%', 1, NULL));";
-$sql[] = "CREATE TEMPORARY TABLE _anon_guard (ok INT NOT NULL);";
-$sql[] = "-- If the active schema is not a temporary one this INSERT fails and the script stops here.";
-$sql[] = "INSERT INTO _anon_guard (ok) VALUES (@guard);";
-$sql[] = "DROP TEMPORARY TABLE _anon_guard;";
-$sql[] = "SET SESSION sql_mode='';";
-$sql[] = "SET FOREIGN_KEY_CHECKS=0;";
-
-// --- Dictionaries
-$dicts = ['_anon_first' => $firstNames, '_anon_last' => $lastNames, '_anon_city' => $cities, '_anon_street' => $streets];
+$dicts = [
+    '_anon_first' => $firstNames,
+    '_anon_last' => $lastNames,
+    '_anon_city' => $cities,
+    '_anon_street' => $streets,
+];
 foreach ($dicts as $name => $values) {
-    $sql[] = "DROP TABLE IF EXISTS `$name`;";
-    $sql[] = "CREATE TABLE `$name` (n INT PRIMARY KEY, v VARCHAR(64)) ENGINE=InnoDB;";
+    $sql[] = 'DROP TEMPORARY TABLE IF EXISTS ' . sqlIdentifier($name) . ';';
+    $sql[] = 'CREATE TEMPORARY TABLE ' . sqlIdentifier($name)
+        . ' (n INT PRIMARY KEY, v VARCHAR(64) NOT NULL) ENGINE=InnoDB;';
     $rows = [];
-    foreach (array_slice($values, 0, DICT_N) as $i => $v) {
-        $rows[] = '(' . $i . ",'" . str_replace("'", "''", $v) . "')";
+    foreach (array_slice($values, 0, DICT_N) as $index => $value) {
+        $rows[] = '(' . $index . ',' . sqlString($value) . ')';
     }
-    $sql[] = "INSERT INTO `$name` (n, v) VALUES " . implode(',', $rows) . ';';
+    $sql[] = 'INSERT INTO ' . sqlIdentifier($name) . ' (n,v) VALUES ' . implode(',', $rows) . ';';
 }
 
-/** Deterministic hash expression derived from the seed. */
-function h(string $key, string $salt): string
+function normalizedSql(string $value, string $kind = 'text'): string
 {
-    return "SHA2(CONCAT(@seed,'{$salt}',COALESCE(" . $key . ",'')),256)";
-}
-function pick(string $dict, string $key, string $salt): string
-{
-    return "(SELECT v FROM `{$dict}` WHERE n = CONV(SUBSTR(" . h($key, $salt) . ",1,6),16,10) % " . DICT_N . ")";
-}
-function fakeEmail(string $key): string
-{
-    return "CONCAT('u', SUBSTR(" . h($key, 'email') . ",1,12), '@" . FAKE_DOMAIN . "')";
-}
-function fakePhone(string $key): string
-{
-    return "CONCAT('+39 3', LPAD(CONV(SUBSTR(" . h($key, 'phone') . ",1,8),16,10) % 100000000, 8, '0'))";
-}
-function fakeZip(string $key): string
-{
-    return "LPAD(CONV(SUBSTR(" . h($key, 'zip') . ",1,6),16,10) % 100000, 5, '0')";
-}
-function fakeAddr(string $key): string
-{
-    return "CONCAT('Via ', " . pick('_anon_street', $key, 'street') . ", ' ', 1 + CONV(SUBSTR(" . h($key, 'civ') . ",1,4),16,10) % 150)";
-}
-function fakeVat(string $key): string
-{
-    return "LPAD(CONV(SUBSTR(" . h($key, 'vat') . ",1,10),16,10) % 100000000000, 11, '0')";
+    $base = "COALESCE(CAST(" . $value . " AS CHAR),'')";
+    if ($kind === 'email') return 'LOWER(TRIM(' . $base . '))';
+    if ($kind === 'phone') {
+        foreach ([' ', '-', '(', ')', '.', '/'] as $char) {
+            $base = 'REPLACE(' . $base . ',' . sqlString($char) . ",'')";
+        }
+        return $base;
+    }
+    if ($kind === 'tax') {
+        return "UPPER(REPLACE(REPLACE(TRIM(" . $base . "), ' ', ''), '-', ''))";
+    }
+    return 'LOWER(TRIM(' . $base . '))';
 }
 
-$act = function (string $t) use ($plan): bool {
-    return isset($plan[$t]) && $plan[$t]['action'] === 'anonymize';
+function h(string $value, string $salt, string $kind = 'text'): string
+{
+    return 'SHA2(CONCAT(@seed,' . sqlString($salt) . ',' . normalizedSql($value, $kind) . '),256)';
+}
+
+function nonEmptyCase(string $value, string $replacement): string
+{
+    return 'CASE WHEN ' . $value . " IS NULL THEN NULL WHEN TRIM(CAST(" . $value
+        . " AS CHAR))='' THEN " . $value . ' ELSE ' . $replacement . ' END';
+}
+
+function pick(string $dict, string $value, string $salt): string
+{
+    $picked = '(SELECT v FROM ' . sqlIdentifier($dict) . ' WHERE n=MOD(CONV(SUBSTR('
+        . h($value, $salt) . ',1,6),16,10),' . DICT_N . '))';
+    return nonEmptyCase($value, $picked);
+}
+
+function fakeEmail(string $value): string
+{
+    return nonEmptyCase(
+        $value,
+        "CONCAT('u',SUBSTR(" . h($value, 'email', 'email') . ",1,20),'@" . FAKE_DOMAIN . "')"
+    );
+}
+
+function fakePhone(string $value): string
+{
+    return nonEmptyCase(
+        $value,
+        "CONCAT('+39 3',LPAD(MOD(CONV(SUBSTR(" . h($value, 'phone', 'phone')
+        . ",1,13),16,10),1000000000),9,'0'))"
+    );
+}
+
+function fakeZip(string $value): string
+{
+    return nonEmptyCase(
+        $value,
+        "LPAD(MOD(CONV(SUBSTR(" . h($value, 'zip') . ",1,10),16,10),100000),5,'0')"
+    );
+}
+
+function fakeAddr(string $value): string
+{
+    return nonEmptyCase(
+        $value,
+        "CONCAT('Via '," . pick('_anon_street', $value, 'street') . ",' ',1+MOD(CONV(SUBSTR("
+        . h($value, 'house') . ",1,8),16,10),150))"
+    );
+}
+
+function fakeCompany(string $value): string
+{
+    return nonEmptyCase($value, "CONCAT('Azienda ',SUBSTR(" . h($value, 'company') . ",1,10))");
+}
+
+function fakeVat(string $value): string
+{
+    $base = "LPAD(MOD(CONV(SUBSTR(" . h($value, 'vat', 'tax')
+        . ",1,13),16,10),10000000000),10,'0')";
+    $parts = [];
+    for ($position = 1; $position <= 10; $position++) {
+        $digit = 'CAST(SUBSTR(' . $base . ',' . $position . ',1) AS UNSIGNED)';
+        $parts[] = $position % 2 === 0
+            ? 'IF((' . $digit . '*2)>9,(' . $digit . '*2)-9,(' . $digit . '*2))'
+            : $digit;
+    }
+    $check = 'MOD(10-MOD((' . implode('+', $parts) . '),10),10)';
+    return nonEmptyCase($value, 'CONCAT(' . $base . ',' . $check . ')');
+}
+
+function fakeTaxCode(string $value): string
+{
+    $digest = h($value, 'tax-code', 'tax');
+    $letter = function (int $offset) use ($digest): string {
+        return 'CHAR(65+MOD(CONV(SUBSTR(' . $digest . ',' . $offset . ',2),16,10),26))';
+    };
+    $number = function (int $offset, int $modulo, int $width) use ($digest): string {
+        return "LPAD(MOD(CONV(SUBSTR(" . $digest . ',' . $offset
+            . ',2),16,10),' . $modulo . '),' . $width . ",'0')";
+    };
+    $base = 'CONCAT('
+        . implode(',', [$letter(1), $letter(3), $letter(5), $letter(7), $letter(9), $letter(11)])
+        . ',' . $number(13, 100, 2)
+        . ",SUBSTR('ABCDEHLMPRST',1+MOD(CONV(SUBSTR(" . $digest . ",15,2),16,10),12),1)"
+        . ",LPAD(1+MOD(CONV(SUBSTR(" . $digest . ",17,2),16,10),28),2,'0')"
+        . ',' . $letter(19)
+        . ',' . $number(21, 1000, 3)
+        . ')';
+    $oddMap = [
+        '0'=>1,'1'=>0,'2'=>5,'3'=>7,'4'=>9,'5'=>13,'6'=>15,'7'=>17,'8'=>19,'9'=>21,
+        'A'=>1,'B'=>0,'C'=>5,'D'=>7,'E'=>9,'F'=>13,'G'=>15,'H'=>17,'I'=>19,'J'=>21,
+        'K'=>2,'L'=>4,'M'=>18,'N'=>20,'O'=>11,'P'=>3,'Q'=>6,'R'=>8,'S'=>12,'T'=>14,
+        'U'=>16,'V'=>10,'W'=>22,'X'=>25,'Y'=>24,'Z'=>23,
+    ];
+    $sum = [];
+    for ($position = 1; $position <= 15; $position++) {
+        $char = 'SUBSTR(' . $base . ',' . $position . ',1)';
+        if ($position % 2 === 1) {
+            $case = 'CASE ' . $char;
+            foreach ($oddMap as $candidate => $score) $case .= ' WHEN ' . sqlString($candidate) . ' THEN ' . $score;
+            $sum[] = $case . ' ELSE 0 END';
+        } else {
+            $sum[] = "IF(" . $char . " BETWEEN '0' AND '9',CAST(" . $char
+                . " AS UNSIGNED),ASCII(" . $char . ')-65)';
+        }
+    }
+    $control = 'CHAR(65+MOD((' . implode('+', $sum) . '),26))';
+    return nonEmptyCase($value, 'CONCAT(' . $base . ',' . $control . ')');
+}
+
+function fakeOpaque(string $value, string $salt, string $prefix = 'anon-'): string
+{
+    return nonEmptyCase($value, 'CONCAT(' . sqlString($prefix) . ',SUBSTR(' . h($value, $salt) . ',1,24))');
+}
+
+$act = function (string $table) use ($plan): bool {
+    return isset($plan[$table]) && $plan[$table]['action'] === 'anonymize';
 };
 
-// --- users
 $tUsers = $p . 'users';
-if ($act($tUsers)) {
-    $sql[] = "UPDATE `$tUsers` SET
-        user_login    = CONCAT('user', ID),
-        user_pass     = '!ANONYMIZED!',
-        user_nicename = CONCAT('user-', ID),
-        user_email    = " . fakeEmail('ID') . ",
-        user_url      = '',
-        display_name  = CONCAT(" . pick('_anon_first', 'ID', 'fn') . ", ' ', " . pick('_anon_last', 'ID', 'ln') . "),
-        user_activation_key = '';";
-}
-
-// --- usermeta
-$tUmeta = $p . 'usermeta';
-if ($act($tUmeta)) {
-    $sql[] = "DELETE FROM `$tUmeta` WHERE meta_key IN ('session_tokens','_new_email','_password_reset_key','wp_user-settings');";
-    $sql[] = "UPDATE `$tUmeta` SET meta_value = " . pick('_anon_first', 'user_id', 'fn') . "
-              WHERE meta_key IN ('first_name','billing_first_name','shipping_first_name','nickname');";
-    $sql[] = "UPDATE `$tUmeta` SET meta_value = " . pick('_anon_last', 'user_id', 'ln') . "
-              WHERE meta_key IN ('last_name','billing_last_name','shipping_last_name');";
-    $sql[] = "UPDATE `$tUmeta` SET meta_value = " . fakeEmail('user_id') . " WHERE meta_key IN ('billing_email','shipping_email');";
-    $sql[] = "UPDATE `$tUmeta` SET meta_value = " . fakePhone('user_id') . " WHERE meta_key IN ('billing_phone','shipping_phone');";
-    $sql[] = "UPDATE `$tUmeta` SET meta_value = " . fakeAddr('user_id') . " WHERE meta_key IN ('billing_address_1','shipping_address_1');";
-    $sql[] = "UPDATE `$tUmeta` SET meta_value = '' WHERE meta_key IN ('billing_address_2','shipping_address_2','billing_company','shipping_company','description');";
-    $sql[] = "UPDATE `$tUmeta` SET meta_value = " . pick('_anon_city', 'user_id', 'city') . " WHERE meta_key IN ('billing_city','shipping_city');";
-    $sql[] = "UPDATE `$tUmeta` SET meta_value = " . fakeZip('user_id') . " WHERE meta_key IN ('billing_postcode','shipping_postcode');";
-    $sql[] = "UPDATE `$tUmeta` SET meta_value = " . fakeVat('user_id') . " WHERE meta_key LIKE '%vat%' OR meta_key LIKE '%codice_fiscale%' OR meta_key LIKE '%_cf' OR meta_key LIKE '%piva%';";
-}
-
-// --- posts (legacy orders) and attachments
+$tUsermeta = $p . 'usermeta';
 $tPosts = $p . 'posts';
+$tPostmeta = $p . 'postmeta';
+$tComments = $p . 'comments';
+$tCommentmeta = $p . 'commentmeta';
+$tOptions = $p . 'options';
+
+if ($act($tUsers)) {
+    $table = sqlIdentifier($tUsers);
+    $sql[] = "UPDATE $table SET "
+        . "user_login=" . fakeOpaque('user_login', 'login', 'user_') . ','
+        . "user_pass='!ANONYMIZED!',"
+        . "user_nicename=" . fakeOpaque('user_nicename', 'nicename', 'user-') . ','
+        . 'user_email=' . fakeEmail('user_email') . ','
+        . "user_url='',"
+        . "display_name=CONCAT(" . pick('_anon_first', 'display_name', 'display-first')
+        . ",' '," . pick('_anon_last', 'display_name', 'display-last') . ');';
+}
+
+if ($act($tUsermeta)) {
+    $table = sqlIdentifier($tUsermeta);
+    $sql[] = "DELETE FROM $table WHERE meta_key IN ('session_tokens','_new_email','_password_reset_key',"
+        . "'_application_passwords'," . sqlString($p . 'user-settings') . ');';
+    $sql[] = "UPDATE $table SET meta_value=" . pick('_anon_first', 'meta_value', 'first-name')
+        . " WHERE meta_key IN ('first_name','billing_first_name','shipping_first_name','nickname');";
+    $sql[] = "UPDATE $table SET meta_value=" . pick('_anon_last', 'meta_value', 'last-name')
+        . " WHERE meta_key IN ('last_name','billing_last_name','shipping_last_name');";
+    $sql[] = "UPDATE $table SET meta_value=" . fakeEmail('meta_value')
+        . " WHERE meta_key IN ('billing_email','shipping_email');";
+    $sql[] = "UPDATE $table SET meta_value=" . fakePhone('meta_value')
+        . " WHERE meta_key IN ('billing_phone','shipping_phone');";
+    $sql[] = "UPDATE $table SET meta_value=" . fakeAddr('meta_value')
+        . " WHERE meta_key IN ('billing_address_1','shipping_address_1');";
+    $sql[] = "UPDATE $table SET meta_value='' WHERE meta_key IN "
+        . "('billing_address_2','shipping_address_2','description');";
+    $sql[] = "UPDATE $table SET meta_value=" . fakeCompany('meta_value')
+        . " WHERE meta_key IN ('billing_company','shipping_company');";
+    $sql[] = "UPDATE $table SET meta_value=" . pick('_anon_city', 'meta_value', 'city')
+        . " WHERE meta_key IN ('billing_city','shipping_city');";
+    $sql[] = "UPDATE $table SET meta_value=" . fakeZip('meta_value')
+        . " WHERE meta_key IN ('billing_postcode','shipping_postcode');";
+    $sql[] = "UPDATE $table SET meta_value=" . fakeVat('meta_value')
+        . " WHERE LOWER(meta_key) LIKE '%vat%' OR LOWER(meta_key) LIKE '%piva%';";
+    $sql[] = "UPDATE $table SET meta_value=" . fakeTaxCode('meta_value')
+        . " WHERE LOWER(meta_key) LIKE '%codice_fiscale%' OR LOWER(meta_key) REGEXP '(^|_)cf$';";
+}
+
 if ($act($tPosts)) {
-    $sql[] = "UPDATE `$tPosts` SET post_excerpt = '', post_password = ''
-              WHERE post_type LIKE 'shop_order%' OR post_type = 'shop_subscription';";
-    if (!$keepAttachments) {
-        $sql[] = "DELETE FROM `$tPosts` WHERE post_type = 'attachment';";
+    $table = sqlIdentifier($tPosts);
+    $sql[] = "UPDATE $table SET post_excerpt='',post_password='' "
+        . "WHERE post_type LIKE 'shop_order%' OR post_type='shop_subscription';";
+}
+
+if ($act($tPostmeta)) {
+    $table = sqlIdentifier($tPostmeta);
+    $sql[] = "UPDATE $table SET meta_value=" . pick('_anon_first', 'meta_value', 'first-name')
+        . " WHERE meta_key IN ('_billing_first_name','_shipping_first_name');";
+    $sql[] = "UPDATE $table SET meta_value=" . pick('_anon_last', 'meta_value', 'last-name')
+        . " WHERE meta_key IN ('_billing_last_name','_shipping_last_name');";
+    $sql[] = "UPDATE $table SET meta_value=" . fakeEmail('meta_value')
+        . " WHERE meta_key IN ('_billing_email','_shipping_email');";
+    $sql[] = "UPDATE $table SET meta_value=" . fakePhone('meta_value')
+        . " WHERE meta_key IN ('_billing_phone','_shipping_phone');";
+    $sql[] = "UPDATE $table SET meta_value=" . fakeAddr('meta_value')
+        . " WHERE meta_key IN ('_billing_address_1','_shipping_address_1');";
+    $sql[] = "UPDATE $table SET meta_value='' WHERE meta_key IN ('_billing_address_2','_shipping_address_2','_customer_user_agent','_customer_note');";
+    $sql[] = "UPDATE $table SET meta_value=" . fakeCompany('meta_value')
+        . " WHERE meta_key IN ('_billing_company','_shipping_company');";
+    $sql[] = "UPDATE $table SET meta_value=" . pick('_anon_city', 'meta_value', 'city')
+        . " WHERE meta_key IN ('_billing_city','_shipping_city');";
+    $sql[] = "UPDATE $table SET meta_value=" . fakeZip('meta_value')
+        . " WHERE meta_key IN ('_billing_postcode','_shipping_postcode');";
+    $sql[] = "UPDATE $table SET meta_value=" . fakeVat('meta_value')
+        . " WHERE LOWER(meta_key) LIKE '%vat%' OR LOWER(meta_key) LIKE '%piva%';";
+    $sql[] = "UPDATE $table SET meta_value=" . fakeTaxCode('meta_value')
+        . " WHERE LOWER(meta_key) LIKE '%codice_fiscale%' OR LOWER(meta_key) REGEXP '(^|_)cf$';";
+    $sql[] = "UPDATE $table SET meta_value=" . fakeOpaque('meta_value', 'payment-reference')
+        . " WHERE meta_key IN ('_transaction_id','_order_key','_payment_tokens','_stripe_customer_id',"
+        . "'_stripe_source_id','_paypal_transaction_id');";
+    $sql[] = "DELETE FROM $table WHERE LOWER(meta_key) REGEXP '(token|secret|api_key)';";
+    $sql[] = "UPDATE $table SET meta_value='" . FAKE_IP . "' WHERE meta_key='_customer_ip_address' AND meta_value<>'';";
+}
+
+if ($act($tComments)) {
+    $table = sqlIdentifier($tComments);
+    $sql[] = "UPDATE $table SET "
+        . "comment_author=CONCAT(" . pick('_anon_first', 'comment_author', 'comment-first')
+        . ", ' ', LEFT(" . pick('_anon_last', 'comment_author', 'comment-last') . ",1),'.'),"
+        . 'comment_author_email=' . fakeEmail('comment_author_email') . ','
+        . "comment_author_url='',"
+        . "comment_author_IP=CASE WHEN comment_author_IP='' THEN '' ELSE '" . FAKE_IP . "' END,"
+        . "comment_agent=CASE WHEN comment_agent='' THEN '' ELSE 'anonymized' END;";
+    $sql[] = "UPDATE $table SET comment_content=CONCAT('[order note redacted #',comment_ID,']') "
+        . "WHERE comment_type='order_note' AND comment_content<>'';";
+    if ($freeTextAction === 'redact') {
+        $sql[] = "UPDATE $table SET comment_content=CONCAT('[comment redacted #',comment_ID,']') "
+            . "WHERE comment_type<>'order_note' AND comment_content<>'';";
     }
 }
 
-// --- postmeta (legacy orders)
-$tPmeta = $p . 'postmeta';
-if ($act($tPmeta)) {
-    $sql[] = "UPDATE `$tPmeta` SET meta_value = " . pick('_anon_first', 'post_id', 'fn') . " WHERE meta_key IN ('_billing_first_name','_shipping_first_name');";
-    $sql[] = "UPDATE `$tPmeta` SET meta_value = " . pick('_anon_last', 'post_id', 'ln') . "  WHERE meta_key IN ('_billing_last_name','_shipping_last_name');";
-    $sql[] = "UPDATE `$tPmeta` SET meta_value = " . fakeEmail('post_id') . " WHERE meta_key = '_billing_email';";
-    $sql[] = "UPDATE `$tPmeta` SET meta_value = " . fakePhone('post_id') . " WHERE meta_key IN ('_billing_phone','_shipping_phone');";
-    $sql[] = "UPDATE `$tPmeta` SET meta_value = " . fakeAddr('post_id') . "  WHERE meta_key IN ('_billing_address_1','_shipping_address_1');";
-    $sql[] = "UPDATE `$tPmeta` SET meta_value = " . pick('_anon_city', 'post_id', 'city') . " WHERE meta_key IN ('_billing_city','_shipping_city');";
-    $sql[] = "UPDATE `$tPmeta` SET meta_value = " . fakeZip('post_id') . "   WHERE meta_key IN ('_billing_postcode','_shipping_postcode');";
-    $sql[] = "UPDATE `$tPmeta` SET meta_value = '' WHERE meta_key IN ('_billing_address_2','_shipping_address_2','_billing_company','_shipping_company','_customer_user_agent','_billing_vat','_customer_note');";
-    $sql[] = "UPDATE `$tPmeta` SET meta_value = '" . FAKE_IP . "' WHERE meta_key = '_customer_ip_address';";
-    $sql[] = "UPDATE `$tPmeta` SET meta_value = CONCAT('anon-', post_id) WHERE meta_key IN ('_transaction_id','_order_key','_payment_tokens','_stripe_customer_id','_stripe_source_id','_paypal_transaction_id');";
-    $sql[] = "DELETE FROM `$tPmeta` WHERE meta_key LIKE '%_token%' OR meta_key LIKE '%_secret%' OR meta_key LIKE '%api_key%';";
+if ($act($tCommentmeta)) {
+    $sql[] = 'DELETE FROM ' . sqlIdentifier($tCommentmeta)
+        . " WHERE LOWER(meta_key) LIKE 'akismet_%' OR LOWER(meta_key) LIKE '%token%' OR LOWER(meta_key) LIKE '%secret%';";
 }
 
-// --- comments (order notes and reviews)
-$tComm = $p . 'comments';
-if ($act($tComm)) {
-    $sql[] = "UPDATE `$tComm` SET
-        comment_author       = CONCAT(" . pick('_anon_first', 'comment_ID', 'fn') . ", ' ', SUBSTR(" . pick('_anon_last', 'comment_ID', 'ln') . ",1,1), '.'),
-        comment_author_email = " . fakeEmail('comment_ID') . ",
-        comment_author_url   = '',
-        comment_author_IP    = '" . FAKE_IP . "',
-        comment_agent        = 'anonymized';";
-    $sql[] = "UPDATE `$tComm` SET comment_content = CONCAT('[nota ordine anonimizzata #', comment_ID, ']') WHERE comment_type = 'order_note';";
+if (!$keepAttachments && $hasTable($tPosts)) {
+    $sql[] = 'CREATE TEMPORARY TABLE _anon_attachments (id BIGINT PRIMARY KEY);';
+    $sql[] = 'INSERT INTO _anon_attachments SELECT ID FROM ' . sqlIdentifier($tPosts) . " WHERE post_type='attachment';";
+    if ($hasTable($tCommentmeta) && $hasTable($tComments)) {
+        $sql[] = 'DELETE cm FROM ' . sqlIdentifier($tCommentmeta) . ' cm JOIN ' . sqlIdentifier($tComments)
+            . ' c ON c.comment_ID=cm.comment_id WHERE c.comment_post_ID IN (SELECT id FROM _anon_attachments);';
+    }
+    if ($hasTable($tComments)) {
+        $sql[] = 'DELETE FROM ' . sqlIdentifier($tComments) . ' WHERE comment_post_ID IN (SELECT id FROM _anon_attachments);';
+    }
+    if ($hasTable($tPostmeta)) {
+        $sql[] = 'DELETE FROM ' . sqlIdentifier($tPostmeta) . ' WHERE post_id IN (SELECT id FROM _anon_attachments);';
+    }
+    if ($hasTable($p . 'term_relationships')) {
+        $sql[] = 'DELETE FROM ' . sqlIdentifier($p . 'term_relationships')
+            . ' WHERE object_id IN (SELECT id FROM _anon_attachments);';
+    }
+    $sql[] = 'DELETE FROM ' . sqlIdentifier($tPosts) . ' WHERE ID IN (SELECT id FROM _anon_attachments);';
+    $sql[] = 'DROP TEMPORARY TABLE _anon_attachments;';
 }
 
-// --- HPOS
 if ($hpos) {
-    $tO = $p . 'wc_orders';
-    if ($act($tO)) {
-        $sql[] = "UPDATE `$tO` SET
-            billing_email = " . fakeEmail('id') . ",
-            ip_address    = '" . FAKE_IP . "',
-            user_agent    = 'anonymized',
-            customer_note = CASE WHEN customer_note IS NULL OR customer_note = '' THEN customer_note ELSE CONCAT('[nota cliente anonimizzata #', id, ']') END,
-            transaction_id = CASE WHEN transaction_id IS NULL OR transaction_id = '' THEN transaction_id ELSE CONCAT('anon-', id) END;";
+    $orders = $p . 'wc_orders';
+    if ($act($orders)) {
+        $sql[] = 'UPDATE ' . sqlIdentifier($orders) . ' SET '
+            . 'billing_email=' . fakeEmail('billing_email') . ','
+            . "ip_address=CASE WHEN ip_address='' THEN '' ELSE '" . FAKE_IP . "' END,"
+            . "user_agent=CASE WHEN user_agent='' THEN '' ELSE 'anonymized' END,"
+            . "customer_note=CASE WHEN customer_note IS NULL OR customer_note='' THEN customer_note ELSE CONCAT('[customer note redacted #',id,']') END,"
+            . 'transaction_id=' . fakeOpaque('transaction_id', 'transaction') . ';';
     }
-    $tA = $p . 'wc_order_addresses';
-    if ($act($tA)) {
-        $sql[] = "UPDATE `$tA` SET
-            first_name = " . pick('_anon_first', 'id', 'fn') . ",
-            last_name  = " . pick('_anon_last', 'id', 'ln') . ",
-            company    = '',
-            address_1  = " . fakeAddr('id') . ",
-            address_2  = '',
-            city       = " . pick('_anon_city', 'id', 'city') . ",
-            postcode   = " . fakeZip('id') . ",
-            email      = CASE WHEN email IS NULL OR email = '' THEN email ELSE " . fakeEmail('id') . " END,
-            phone      = CASE WHEN phone IS NULL OR phone = '' THEN phone ELSE " . fakePhone('id') . " END;";
+    $addresses = $p . 'wc_order_addresses';
+    if ($act($addresses)) {
+        $sql[] = 'UPDATE ' . sqlIdentifier($addresses) . ' SET '
+            . 'first_name=' . pick('_anon_first', 'first_name', 'first-name') . ','
+            . 'last_name=' . pick('_anon_last', 'last_name', 'last-name') . ','
+            . 'company=' . fakeCompany('company') . ','
+            . 'address_1=' . fakeAddr('address_1') . ",address_2='',"
+            . 'city=' . pick('_anon_city', 'city', 'city') . ','
+            . 'postcode=' . fakeZip('postcode') . ','
+            . 'email=' . fakeEmail('email') . ',phone=' . fakePhone('phone') . ';';
     }
-    $tM = $p . 'wc_orders_meta';
-    if ($act($tM)) {
-        $sql[] = "DELETE FROM `$tM` WHERE meta_key LIKE '%_token%' OR meta_key LIKE '%_secret%' OR meta_key LIKE '%api_key%' OR meta_key LIKE '%customer_id%';";
-        $sql[] = "UPDATE `$tM` SET meta_value = " . fakeVat('order_id') . " WHERE meta_key LIKE '%vat%' OR meta_key LIKE '%codice_fiscale%' OR meta_key LIKE '%piva%';";
+    $orderMeta = $p . 'wc_orders_meta';
+    if ($act($orderMeta)) {
+        $table = sqlIdentifier($orderMeta);
+        $sql[] = "DELETE FROM $table WHERE LOWER(meta_key) REGEXP '(token|secret|api_key|customer_id)';";
+        $sql[] = "UPDATE $table SET meta_value=" . fakeVat('meta_value')
+            . " WHERE LOWER(meta_key) LIKE '%vat%' OR LOWER(meta_key) LIKE '%piva%';";
+        $sql[] = "UPDATE $table SET meta_value=" . fakeTaxCode('meta_value')
+            . " WHERE LOWER(meta_key) LIKE '%codice_fiscale%' OR LOWER(meta_key) REGEXP '(^|_)cf$';";
     }
-    $tOp = $p . 'wc_order_operational_data';
-    if ($act($tOp)) {
-        $sql[] = "UPDATE `$tOp` SET order_key = CONCAT('wc_order_anon', order_id);";
+    $operational = $p . 'wc_order_operational_data';
+    if ($act($operational)) {
+        $sql[] = 'UPDATE ' . sqlIdentifier($operational) . ' SET order_key='
+            . fakeOpaque('order_key', 'order-key', 'wc_order_') . ';';
     }
-    $tCl = $p . 'wc_customer_lookup';
-    if ($act($tCl)) {
-        $sql[] = "UPDATE `$tCl` SET
-            username   = CONCAT('user', customer_id),
-            first_name = " . pick('_anon_first', 'customer_id', 'fn') . ",
-            last_name  = " . pick('_anon_last', 'customer_id', 'ln') . ",
-            email      = " . fakeEmail('customer_id') . ",
-            city       = " . pick('_anon_city', 'customer_id', 'city') . ",
-            postcode   = " . fakeZip('customer_id') . ";";
+    $customers = $p . 'wc_customer_lookup';
+    if ($act($customers)) {
+        $sql[] = 'UPDATE ' . sqlIdentifier($customers) . ' SET '
+            . 'username=' . fakeOpaque('username', 'login', 'user_') . ','
+            . 'first_name=' . pick('_anon_first', 'first_name', 'first-name') . ','
+            . 'last_name=' . pick('_anon_last', 'last_name', 'last-name') . ','
+            . 'email=' . fakeEmail('email') . ','
+            . 'city=' . pick('_anon_city', 'city', 'city') . ','
+            . 'postcode=' . fakeZip('postcode') . ';';
     }
 }
 
-// --- Download log and permissions
-$tDl = $p . 'wc_download_log';
-if ($act($tDl) && $hasCol($tDl, 'user_ip_address')) {
-    $sql[] = "UPDATE `$tDl` SET user_ip_address = '" . FAKE_IP . "';";
+$downloadLog = $p . 'wc_download_log';
+if ($act($downloadLog) && $hasCol($downloadLog, 'user_ip_address')) {
+    $sql[] = 'UPDATE ' . sqlIdentifier($downloadLog)
+        . " SET user_ip_address=CASE WHEN user_ip_address='' THEN '' ELSE '" . FAKE_IP . "' END;";
 }
-$tDp = $p . 'woocommerce_downloadable_product_permissions';
-if ($act($tDp)) {
-    $sql[] = "UPDATE `$tDp` SET user_email = " . fakeEmail('user_id') . ";";
-}
-
-// --- options: secrets and transients
-$tOpt = $p . 'options';
-if ($act($tOpt)) {
-    $sql[] = "DELETE FROM `$tOpt` WHERE option_name LIKE '\\_transient\\_%' OR option_name LIKE '\\_site\\_transient\\_%';";
-    $secretPatterns = ['%api_key%','%apikey%','%_secret%','%secret_key%','%password%','%passwd%','%private_key%',
-                       '%access_token%','%refresh_token%','%_token%','%smtp%','%mailgun%','%sendgrid%','%license%',
-                       '%stripe%','%paypal%','%braintree%','%nexi%','%satispay%','%recaptcha%','%_salt%','%aws_%'];
-    $where = implode(' OR ', array_map(function ($x) { return "option_name LIKE '" . $x . "'"; }, $secretPatterns));
-    $sql[] = "UPDATE `$tOpt` SET option_value = '' WHERE (" . $where . ") AND option_name NOT IN ('siteurl','home','blogname','admin_email');";
-    $sql[] = "UPDATE `$tOpt` SET option_value = 'test@" . FAKE_DOMAIN . "' WHERE option_name IN ('admin_email','new_admin_email','woocommerce_stock_email_recipient');";
+$permissions = $p . 'woocommerce_downloadable_product_permissions';
+if ($act($permissions)) {
+    $sql[] = 'UPDATE ' . sqlIdentifier($permissions) . ' SET user_email=' . fakeEmail('user_email') . ';';
 }
 
-// --- Time-based subsetting
+if ($act($tOptions)) {
+    $table = sqlIdentifier($tOptions);
+    $sql[] = "DELETE FROM $table WHERE option_name LIKE '\\_transient\\_%' OR option_name LIKE '\\_site\\_transient\\_%';";
+    $sql[] = "UPDATE $table SET option_value='' WHERE LOWER(option_name) REGEXP "
+        . "'(api.?key|secret|password|passwd|private.?key|access.?token|refresh.?token|smtp|mailgun|sendgrid|license|stripe|paypal|braintree|nexi|satispay|recaptcha|aws_)' "
+        . "AND option_name NOT IN ('siteurl','home','blogname','admin_email');";
+    $sql[] = "UPDATE $table SET option_value='test@" . FAKE_DOMAIN
+        . "' WHERE option_name IN ('admin_email','new_admin_email','woocommerce_stock_email_recipient');";
+}
+
+foreach ($residualCandidates as $candidate) {
+    if (($residualActions[$candidate['scope']][$candidate['key']] ?? 'redact') !== 'redact') continue;
+    $sql[] = 'UPDATE ' . sqlIdentifier($candidate['table'])
+        . ' SET ' . sqlIdentifier($candidate['value_column']) . '=' . sqlString('[redacted]')
+        . ' WHERE ' . sqlIdentifier($candidate['key_column']) . '=' . sqlString($candidate['key']) . ';';
+}
+
 if ($monthsBack > 0) {
     if ($hpos) {
-        $sql[] = "CREATE TEMPORARY TABLE _anon_drop (id BIGINT PRIMARY KEY);";
-        $sql[] = "INSERT INTO _anon_drop SELECT id FROM `" . $p . "wc_orders` WHERE date_created_gmt < DATE_SUB(UTC_TIMESTAMP(), INTERVAL " . $monthsBack . " MONTH);";
-        foreach ([[$p . 'wc_order_addresses', 'order_id'], [$p . 'wc_orders_meta', 'order_id'],
-                  [$p . 'wc_order_operational_data', 'order_id'], [$p . 'wc_order_stats', 'order_id'],
-                  [$p . 'wc_order_product_lookup', 'order_id'], [$p . 'wc_order_tax_lookup', 'order_id'],
-                  [$p . 'wc_order_coupon_lookup', 'order_id'], [$p . 'woocommerce_order_items', 'order_id']] as [$t, $col]) {
-            if ($hasTable($t) && $hasCol($t, $col)) {
-                $sql[] = "DELETE FROM `$t` WHERE `$col` IN (SELECT id FROM _anon_drop);";
+        $sql[] = 'CREATE TEMPORARY TABLE _anon_drop (id BIGINT PRIMARY KEY);';
+        $sql[] = 'INSERT INTO _anon_drop SELECT id FROM ' . sqlIdentifier($p . 'wc_orders')
+            . ' WHERE date_created_gmt<DATE_SUB(UTC_TIMESTAMP(),INTERVAL ' . $monthsBack . ' MONTH);';
+        $items = $p . 'woocommerce_order_items';
+        $itemmeta = $p . 'woocommerce_order_itemmeta';
+        if ($hasTable($items)) {
+            $sql[] = 'CREATE TEMPORARY TABLE _anon_drop_items (id BIGINT PRIMARY KEY);';
+            $sql[] = 'INSERT IGNORE INTO _anon_drop_items SELECT order_item_id FROM ' . sqlIdentifier($items)
+                . ' WHERE order_id IN (SELECT id FROM _anon_drop);';
+            if ($hasTable($itemmeta)) {
+                $sql[] = 'DELETE FROM ' . sqlIdentifier($itemmeta)
+                    . ' WHERE order_item_id IN (SELECT id FROM _anon_drop_items);';
+            }
+            $sql[] = 'DELETE FROM ' . sqlIdentifier($items)
+                . ' WHERE order_item_id IN (SELECT id FROM _anon_drop_items);';
+            $sql[] = 'DROP TEMPORARY TABLE _anon_drop_items;';
+        }
+        foreach ([
+            [$p . 'wc_order_addresses', 'order_id'], [$p . 'wc_orders_meta', 'order_id'],
+            [$p . 'wc_order_operational_data', 'order_id'], [$p . 'wc_order_stats', 'order_id'],
+            [$p . 'wc_order_product_lookup', 'order_id'], [$p . 'wc_order_tax_lookup', 'order_id'],
+            [$p . 'wc_order_coupon_lookup', 'order_id'],
+        ] as $dependency) {
+            if ($hasTable($dependency[0]) && $hasCol($dependency[0], $dependency[1])) {
+                $sql[] = 'DELETE FROM ' . sqlIdentifier($dependency[0]) . ' WHERE '
+                    . sqlIdentifier($dependency[1]) . ' IN (SELECT id FROM _anon_drop);';
             }
         }
-        $sql[] = "DELETE FROM `" . $p . "wc_orders` WHERE id IN (SELECT id FROM _anon_drop);";
-        $sql[] = "DROP TEMPORARY TABLE _anon_drop;";
+        $sql[] = 'DELETE FROM ' . sqlIdentifier($p . 'wc_orders') . ' WHERE id IN (SELECT id FROM _anon_drop);';
+        $sql[] = 'DROP TEMPORARY TABLE _anon_drop;';
     }
     if ($legacy) {
-        $sql[] = "CREATE TEMPORARY TABLE _anon_drop_legacy (id BIGINT PRIMARY KEY);";
-        $sql[] = "INSERT INTO _anon_drop_legacy SELECT ID FROM `$tPosts` WHERE post_type LIKE 'shop_order%' AND post_date_gmt < DATE_SUB(UTC_TIMESTAMP(), INTERVAL " . $monthsBack . " MONTH);";
-        $sql[] = "DELETE FROM `$tPmeta` WHERE post_id IN (SELECT id FROM _anon_drop_legacy);";
-        $sql[] = "DELETE FROM `$tComm` WHERE comment_post_ID IN (SELECT id FROM _anon_drop_legacy);";
-        $sql[] = "DELETE FROM `$tPosts` WHERE ID IN (SELECT id FROM _anon_drop_legacy);";
-        $sql[] = "DROP TEMPORARY TABLE _anon_drop_legacy;";
+        $sql[] = 'CREATE TEMPORARY TABLE _anon_drop_legacy (id BIGINT PRIMARY KEY);';
+        $sql[] = 'INSERT INTO _anon_drop_legacy SELECT ID FROM ' . sqlIdentifier($tPosts)
+            . " WHERE post_type LIKE 'shop_order%' AND post_date_gmt<DATE_SUB(UTC_TIMESTAMP(),INTERVAL "
+            . $monthsBack . ' MONTH);';
+        $items = $p . 'woocommerce_order_items';
+        $itemmeta = $p . 'woocommerce_order_itemmeta';
+        if ($hasTable($items)) {
+            $sql[] = 'CREATE TEMPORARY TABLE _anon_drop_legacy_items (id BIGINT PRIMARY KEY);';
+            $sql[] = 'INSERT IGNORE INTO _anon_drop_legacy_items SELECT order_item_id FROM ' . sqlIdentifier($items)
+                . ' WHERE order_id IN (SELECT id FROM _anon_drop_legacy);';
+            if ($hasTable($itemmeta)) {
+                $sql[] = 'DELETE FROM ' . sqlIdentifier($itemmeta)
+                    . ' WHERE order_item_id IN (SELECT id FROM _anon_drop_legacy_items);';
+            }
+            $sql[] = 'DELETE FROM ' . sqlIdentifier($items)
+                . ' WHERE order_item_id IN (SELECT id FROM _anon_drop_legacy_items);';
+            $sql[] = 'DROP TEMPORARY TABLE _anon_drop_legacy_items;';
+        }
+        if ($hasTable($tCommentmeta) && $hasTable($tComments)) {
+            $sql[] = 'DELETE cm FROM ' . sqlIdentifier($tCommentmeta) . ' cm JOIN ' . sqlIdentifier($tComments)
+                . ' c ON c.comment_ID=cm.comment_id WHERE c.comment_post_ID IN (SELECT id FROM _anon_drop_legacy);';
+        }
+        if ($hasTable($tPostmeta)) {
+            $sql[] = 'DELETE FROM ' . sqlIdentifier($tPostmeta)
+                . ' WHERE post_id IN (SELECT id FROM _anon_drop_legacy);';
+        }
+        if ($hasTable($tComments)) {
+            $sql[] = 'DELETE FROM ' . sqlIdentifier($tComments)
+                . ' WHERE comment_post_ID IN (SELECT id FROM _anon_drop_legacy);';
+        }
+        $sql[] = 'DELETE FROM ' . sqlIdentifier($tPosts) . ' WHERE ID IN (SELECT id FROM _anon_drop_legacy);';
+        $sql[] = 'DROP TEMPORARY TABLE _anon_drop_legacy;';
     }
 }
 
-// --- Service account
-if ($serviceAdmin && $hasTable($tUsers)) {
-    $login = addslashes($serviceAdmin['login']);
-    $hash  = addslashes($serviceAdmin['hash']);
-    $sql[] = "INSERT INTO `$tUsers` (user_login, user_pass, user_nicename, user_email, user_registered, display_name)
-              VALUES ('$login', '$hash', '$login', '$login@" . FAKE_DOMAIN . "', UTC_TIMESTAMP(), 'Xeader Test');";
-    $sql[] = "SET @svc := LAST_INSERT_ID();";
-    $sql[] = "INSERT INTO `$tUmeta` (user_id, meta_key, meta_value) VALUES (@svc, '" . $p . "capabilities', 'a:1:{s:13:\"administrator\";b:1;}');";
-    $sql[] = "INSERT INTO `$tUmeta` (user_id, meta_key, meta_value) VALUES (@svc, '" . $p . "user_level', '10');";
+if ($serviceAdmin && $act($tUsers) && $act($tUsermeta)) {
+    $login = sqlString($serviceAdmin['login']);
+    $hash = sqlString($serviceAdmin['hash']);
+    $sql[] = 'INSERT INTO ' . sqlIdentifier($tUsers)
+        . " (user_login,user_pass,user_nicename,user_email,user_registered,display_name) VALUES "
+        . "($login,$hash,$login," . sqlString($serviceAdmin['login'] . '@' . FAKE_DOMAIN)
+        . ",UTC_TIMESTAMP(),'Service Administrator');";
+    $sql[] = 'SET @service_user_id:=LAST_INSERT_ID();';
+    $sql[] = 'INSERT INTO ' . sqlIdentifier($tUsermeta)
+        . ' (user_id,meta_key,meta_value) VALUES (@service_user_id,'
+        . sqlString($p . 'capabilities') . ',' . sqlString('a:1:{s:13:"administrator";b:1;}') . '),'
+        . '(@service_user_id,' . sqlString($p . 'user_level') . ",'10');";
 }
 
-// --- Drop dictionaries
 foreach (array_keys($dicts) as $name) {
-    $sql[] = "DROP TABLE IF EXISTS `$name`;";
+    $sql[] = 'DROP TEMPORARY TABLE IF EXISTS ' . sqlIdentifier($name) . ';';
 }
-$sql[] = "SET FOREIGN_KEY_CHECKS=1;";
+$sql[] = 'SET FOREIGN_KEY_CHECKS=1;';
 
-$old = umask(0177);
-file_put_contents($sqlFile, implode("\n", $sql) . "\n");
-chmod($sqlFile, 0600);
-umask($old);
-
+writePrivateFile($sqlFile, implode("\n", $sql) . "\n");
+$GLOBALS['CTX']['tmp_files'][] = $sqlFile;
 execSqlFile($sqlFile, $tmpDb);
-ok(count($sql) . ' statements applied to the temporary schema');
-
+ok(count($sql) . ' guarded statements applied to temporary schema.');
 // ===========================================================================
 // 8. VERIFICATION
 // ===========================================================================
-step('Residual data checks');
+step('Residual-data and integrity checks');
 
 $checks = [];
+$addCheck = function (string $id, string $sql) use (&$checks): void {
+    $checks[$id] = $sql;
+};
 if ($hasTable($tUsers)) {
-    $checks['user emails'] = "SELECT COUNT(*) FROM `$tUsers` WHERE user_email NOT LIKE '%@" . FAKE_DOMAIN . "'";
-    $checks['password hashes'] = "SELECT COUNT(*) FROM `$tUsers` WHERE user_pass <> '!ANONYMIZED!'" . ($serviceAdmin ? " AND user_login <> '" . addslashes($serviceAdmin['login']) . "'" : '');
+    $users = sqlIdentifier($tUsers);
+    $sourceUsers = sqlIdentifier($db['name']) . '.' . $users;
+    $addCheck('user_emails_outside_fake_domain',
+        "SELECT COUNT(*) FROM $users WHERE user_email<>'' AND user_email NOT LIKE '%@" . FAKE_DOMAIN . "'");
+    $passwordWhere = "user_pass<>'!ANONYMIZED!'";
+    if ($serviceAdmin) $passwordWhere .= ' AND user_login<>' . sqlString($serviceAdmin['login']);
+    $addCheck('reusable_user_password_hashes', "SELECT COUNT(*) FROM $users WHERE $passwordWhere");
+    $addCheck('unchanged_user_emails',
+        "SELECT COUNT(*) FROM $users t JOIN $sourceUsers s ON s.ID=t.ID "
+        . "WHERE t.user_email<>'' AND t.user_email=s.user_email");
+}
+if ($hasTable($tUsermeta)) {
+    $table = sqlIdentifier($tUsermeta);
+    $source = sqlIdentifier($db['name']) . '.' . $table;
+    $addCheck('wordpress_application_passwords',
+        "SELECT COUNT(*) FROM $table WHERE meta_key='_application_passwords'");
+    $addCheck('usermeta_emails_outside_fake_domain',
+        "SELECT COUNT(*) FROM $table WHERE meta_key IN ('billing_email','shipping_email') "
+        . "AND meta_value<>'' AND meta_value NOT LIKE '%@" . FAKE_DOMAIN . "'");
+    $addCheck('unchanged_known_usermeta_pii',
+        "SELECT COUNT(*) FROM $table t JOIN $source s ON s.umeta_id=t.umeta_id "
+        . "WHERE t.meta_value<>'' AND t.meta_value=s.meta_value AND ("
+        . "t.meta_key REGEXP '(first_name|last_name|nickname|email|phone|address|company|city|postcode|vat|piva|codice_fiscale|(^|_)cf$)')");
+}
+if ($hasTable($tPostmeta)) {
+    $table = sqlIdentifier($tPostmeta);
+    $source = sqlIdentifier($db['name']) . '.' . $table;
+    $addCheck('legacy_order_emails_outside_fake_domain',
+        "SELECT COUNT(*) FROM $table WHERE meta_key IN ('_billing_email','_shipping_email') "
+        . "AND meta_value<>'' AND meta_value NOT LIKE '%@" . FAKE_DOMAIN . "'");
+    $addCheck('unchanged_known_legacy_order_pii',
+        "SELECT COUNT(*) FROM $table t JOIN $source s ON s.meta_id=t.meta_id "
+        . "WHERE t.meta_value<>'' AND t.meta_value=s.meta_value AND LOWER(t.meta_key) "
+        . "REGEXP '^_(billing|shipping|customer|transaction|order|payment|stripe|paypal)'");
+}
+if ($hasTable($tComments)) {
+    $comments = sqlIdentifier($tComments);
+    $addCheck('comment_emails_outside_fake_domain',
+        "SELECT COUNT(*) FROM $comments WHERE comment_author_email<>'' "
+        . "AND comment_author_email NOT LIKE '%@" . FAKE_DOMAIN . "'");
+    $addCheck('comment_ip_addresses',
+        "SELECT COUNT(*) FROM $comments WHERE comment_author_IP NOT IN (''," . sqlString(FAKE_IP) . ')');
+    if ($freeTextAction === 'redact') {
+        $addCheck('unredacted_comment_bodies',
+            "SELECT COUNT(*) FROM $comments WHERE comment_content<>'' "
+            . "AND comment_content NOT LIKE '[comment redacted #%]' "
+            . "AND comment_content NOT LIKE '[order note redacted #%]'");
+    }
+}
+if ($hasTable($tCommentmeta)) {
+    $addCheck('akismet_original_payloads',
+        'SELECT COUNT(*) FROM ' . sqlIdentifier($tCommentmeta) . " WHERE LOWER(meta_key) LIKE 'akismet_%'");
 }
 if ($hpos && $hasTable($p . 'wc_orders')) {
-    $checks['HPOS order emails'] = "SELECT COUNT(*) FROM `" . $p . "wc_orders` WHERE billing_email <> '' AND billing_email NOT LIKE '%@" . FAKE_DOMAIN . "'";
-    $checks['HPOS order IP addresses']    = "SELECT COUNT(*) FROM `" . $p . "wc_orders` WHERE ip_address NOT IN ('', '" . FAKE_IP . "')";
+    $orders = sqlIdentifier($p . 'wc_orders');
+    $sourceOrders = sqlIdentifier($db['name']) . '.' . $orders;
+    $addCheck('hpos_emails_outside_fake_domain',
+        "SELECT COUNT(*) FROM $orders WHERE billing_email<>'' AND billing_email NOT LIKE '%@" . FAKE_DOMAIN . "'");
+    $addCheck('hpos_ip_addresses',
+        "SELECT COUNT(*) FROM $orders WHERE ip_address NOT IN (''," . sqlString(FAKE_IP) . ')');
+    $addCheck('unchanged_hpos_emails',
+        "SELECT COUNT(*) FROM $orders t JOIN $sourceOrders s ON s.id=t.id "
+        . "WHERE t.billing_email<>'' AND t.billing_email=s.billing_email");
 }
-if ($legacy && $hasTable($tPmeta)) {
-    $checks['legacy order emails'] = "SELECT COUNT(*) FROM `$tPmeta` WHERE meta_key='_billing_email' AND meta_value <> '' AND meta_value NOT LIKE '%@" . FAKE_DOMAIN . "'";
+if ($hasTable($p . 'wc_order_addresses')) {
+    $addresses = sqlIdentifier($p . 'wc_order_addresses');
+    $sourceAddresses = sqlIdentifier($db['name']) . '.' . $addresses;
+    $addCheck('hpos_address_emails_outside_fake_domain',
+        "SELECT COUNT(*) FROM $addresses WHERE email<>'' AND email NOT LIKE '%@" . FAKE_DOMAIN . "'");
+    $addCheck('unchanged_hpos_address_pii',
+        "SELECT COUNT(*) FROM $addresses t JOIN $sourceAddresses s ON s.id=t.id WHERE "
+        . "(t.email<>'' AND t.email=s.email) OR (t.phone<>'' AND t.phone=s.phone) "
+        . "OR (t.address_1<>'' AND t.address_1=s.address_1)");
 }
-if ($hasTable($tComm)) {
-    $checks['comment emails'] = "SELECT COUNT(*) FROM `$tComm` WHERE comment_author_email <> '' AND comment_author_email NOT LIKE '%@" . FAKE_DOMAIN . "'";
+if ($hasTable($p . 'wc_customer_lookup')) {
+    $lookup = sqlIdentifier($p . 'wc_customer_lookup');
+    $addCheck('customer_lookup_emails_outside_fake_domain',
+        "SELECT COUNT(*) FROM $lookup WHERE email<>'' AND email NOT LIKE '%@" . FAKE_DOMAIN . "'");
 }
-foreach ($plan as $t => $v) {
-    if ($v['action'] === 'schema') {
-        $checks['emptied ' . $t] = "SELECT COUNT(*) FROM `$t`";
+if ($hasTable($permissions)) {
+    $addCheck('download_permission_emails_outside_fake_domain',
+        'SELECT COUNT(*) FROM ' . sqlIdentifier($permissions)
+        . " WHERE user_email<>'' AND user_email NOT LIKE '%@" . FAKE_DOMAIN . "'");
+}
+if ($hasTable($tOptions)) {
+    $addCheck('named_secrets_in_options',
+        'SELECT COUNT(*) FROM ' . sqlIdentifier($tOptions)
+        . " WHERE option_value<>'' AND LOWER(option_name) REGEXP "
+        . "'(api.?key|secret|password|passwd|private.?key|access.?token|refresh.?token|smtp|mailgun|sendgrid|stripe|paypal|braintree|nexi|satispay|recaptcha|aws_)'");
+}
+foreach ($plan as $table => $item) {
+    if ($item['action'] === 'schema') {
+        $addCheck('structure_only:' . $table, 'SELECT COUNT(*) FROM ' . sqlIdentifier($table));
     }
+}
+$addCheck('triggers_in_working_schema',
+    'SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=' . sqlString($tmpDb));
+foreach ($residualCandidates as $candidate) {
+    if (($residualActions[$candidate['scope']][$candidate['key']] ?? '') !== 'redact') continue;
+    $addCheck(
+        'residual_redaction:' . $candidate['scope'] . ':' . $candidate['key'],
+        'SELECT COUNT(*) FROM ' . sqlIdentifier($candidate['table'])
+        . ' WHERE ' . sqlIdentifier($candidate['key_column']) . '=' . sqlString($candidate['key'])
+        . ' AND ' . sqlIdentifier($candidate['value_column']) . '<>' . sqlString('[redacted]')
+    );
+}
+if ($monthsBack > 0 && $hasTable($p . 'woocommerce_order_itemmeta') && $hasTable($p . 'woocommerce_order_items')) {
+    $addCheck('orphan_order_itemmeta',
+        'SELECT COUNT(*) FROM ' . sqlIdentifier($p . 'woocommerce_order_itemmeta') . ' m LEFT JOIN '
+        . sqlIdentifier($p . 'woocommerce_order_items')
+        . ' i ON i.order_item_id=m.order_item_id WHERE i.order_item_id IS NULL');
+}
+if (!$keepAttachments && $hasTable($tPosts)) {
+    $addCheck('attachment_records',
+        'SELECT COUNT(*) FROM ' . sqlIdentifier($tPosts) . " WHERE post_type='attachment'");
 }
 
 $failed = [];
-foreach ($checks as $label => $sqlCheck) {
-    $n = (int)qScalar($sqlCheck, $tmpDb, '0');
-    if ($n > 0) { $failed[$label] = $n; out('  ' . c('✘', 'red') . ' ' . $label . ': ' . $n . ' rows left'); }
-    else        { ok($label); }
+$checkResults = [];
+foreach ($checks as $id => $sqlCheck) {
+    $count = (int)qScalar($sqlCheck, $tmpDb, '0');
+    $status = $count === 0 ? 'passed' : 'failed';
+    $checkResults[] = ['id' => $id, 'status' => $status, 'rows' => $count];
+    if ($count === 0) ok($id);
+    else {
+        $failed[$id] = $count;
+        out('  ' . c('✘', 'red') . ' ' . $id . ': ' . $count . ' rows');
+    }
 }
 if ($failed) {
-    fail("Verification failed: no artifact has been produced.\n  The temporary schema has been dropped. Please report this to Xeader so the rules can be updated.");
+    fail("Verification failed: no artifact was published.\nThe working schema will be cleaned.");
 }
 
-// ===========================================================================
-// 9. FINAL DUMP, CHECKSUM, MANIFEST
-// ===========================================================================
-step('Artifact generation');
-
-$finalSql = $outputDir . '/.final-' . $stamp . '.sql';
-$GLOBALS['CTX']['tmp_files'][] = $finalSql;
-$cmd = $base . ' ' . escapeshellarg($tmpDb) . ' > ' . escapeshellarg($finalSql);
-$o = [];
-if (sh($cmd, $o, $e) !== 0) fail("Final dump failed:\n" . diag($o, $e));
-
-// Strip DEFINER clauses while compressing
-$outFile = $outputDir . '/shop-anon-' . $stamp . '.sql.gz';
-$in  = fopen($finalSql, 'r');
-$gz  = gzopen($outFile, 'wb9');
-if (!$in || !$gz) fail('Could not write the final artifact.');
-while (($line = fgets($in)) !== false) {
-    $line = preg_replace('/\/\*!\d+ DEFINER=[^*]+\*\//', '', $line);
-    gzwrite($gz, $line);
-}
-fclose($in);
-gzclose($gz);
-$sha = hash_file('sha256', $outFile);
-@unlink($finalSql);
-ok('Artifact: ' . basename($outFile) . ' (' . fmtBytes((int)filesize($outFile)) . ')');
-
+// Collect evidence before removing the working schema.
 $rowCounts = [];
-foreach (array_keys($plan) as $t) {
-    if ($plan[$t]['action'] === 'exclude') continue;
-    $rowCounts[$t] = (int)qScalar("SELECT COUNT(*) FROM `$t`", $tmpDb, '0');
+foreach ($plan as $table => $item) {
+    if ($item['action'] === 'exclude') continue;
+    $rowCounts[$table] = (int)qScalar('SELECT COUNT(*) FROM ' . sqlIdentifier($table), $tmpDb, '0');
+}
+$attachmentRows = null;
+if ($keepAttachments && isset($rowCounts[$tPosts])) {
+    $attachmentRows = (int)qScalar(
+        'SELECT COUNT(*) FROM ' . sqlIdentifier($tPosts) . " WHERE post_type='attachment'",
+        $tmpDb,
+        '0'
+    );
+}
+if ($freeTextAction === 'preserve' && isset($rowCounts[$tComments])) {
+    $preservedTextRows = (int)qScalar(
+        'SELECT COUNT(*) FROM ' . sqlIdentifier($tComments)
+        . " WHERE comment_content IS NOT NULL AND TRIM(CAST(comment_content AS CHAR))<>''",
+        $tmpDb,
+        '0'
+    );
+    foreach ($residualExceptions as &$exception) {
+        if (($exception['scope'] ?? '') === 'comment_text') $exception['rows'] = $preservedTextRows;
+    }
+    unset($exception);
+}
+
+// ===========================================================================
+// 9. FINAL DUMP, CHECKSUM, MANIFEST AND PUBLICATION
+// ===========================================================================
+step('Artifact generation in private staging');
+
+$finalSql = $stageDir . '/final.sql';
+createPrivateFile($finalSql);
+$GLOBALS['CTX']['tmp_files'][] = $finalSql;
+$output = [];
+$errors = [];
+$command = $baseDump . ' ' . escapeshellarg($tmpDb) . ' > ' . escapeshellarg($finalSql);
+if (sh($command, $output, $errors) !== 0) fail("Final dump failed:\n" . diag($output, $errors));
+if (!is_file($finalSql) || filesize($finalSql) === 0) fail('Final SQL dump is empty.');
+
+$artifactStem = 'shop-anon-' . $runId;
+$artifactName = $artifactStem . '.sql.gz';
+$stageArtifact = $stageDir . '/' . $artifactName;
+createPrivateFile($stageArtifact);
+$GLOBALS['CTX']['tmp_files'][] = $stageArtifact;
+$input = @fopen($finalSql, 'rb');
+$gzip = @gzopen($stageArtifact, 'wb9');
+if ($input === false || $gzip === false) fail('Could not open final dump compression streams.');
+$compressionOk = true;
+while (($line = fgets($input)) !== false) {
+    $line = preg_replace('/\/\*!\d+ DEFINER=[^*]+\*\//', '', $line);
+    if ($line === null || gzwrite($gzip, $line) === false) {
+        $compressionOk = false;
+        break;
+    }
+}
+if (!feof($input)) $compressionOk = false;
+if (!fclose($input)) $compressionOk = false;
+if (!gzclose($gzip)) $compressionOk = false;
+if (!$compressionOk || !is_file($stageArtifact) || filesize($stageArtifact) === 0) {
+    fail('Compressed artifact could not be finalized.');
+}
+$testGzip = @gzopen($stageArtifact, 'rb');
+if ($testGzip === false) fail('Compressed artifact validation failed.');
+while (!gzeof($testGzip)) {
+    if (gzread($testGzip, 1024 * 1024) === false) {
+        gzclose($testGzip);
+        fail('Compressed artifact is corrupt.');
+    }
+}
+if (!gzclose($testGzip)) fail('Compressed artifact validation could not close the stream.');
+
+$sha = hash_file('sha256', $stageArtifact);
+if (!is_string($sha) || strlen($sha) !== 64) fail('Could not calculate artifact checksum.');
+if (!@unlink($finalSql)) fail('Could not remove uncompressed final dump.');
+$GLOBALS['CTX']['tmp_files'] = array_values(array_diff($GLOBALS['CTX']['tmp_files'], [$finalSql]));
+
+$exceptions = [];
+foreach ($residualExceptions as $exception) {
+    $exceptions[] = [
+        'kind' => 'operator_preserved_data',
+        'scope' => $exception['scope'],
+        'key' => $exception['key'] ?? null,
+        'rows' => $exception['rows'] ?? null,
+    ];
+}
+if ($keepAttachments) {
+    $exceptions[] = [
+        'kind' => 'attachments_retained',
+        'scope' => 'posts',
+        'rows' => $attachmentRows,
+    ];
+}
+foreach ($copiedUnknown as $table) {
+    $exceptions[] = [
+        'kind' => 'unrecognized_table_copied',
+        'scope' => $table,
+        'rows' => $rowCounts[$table] ?? null,
+    ];
+}
+if (!$hasPcntl && $opts['allow-unsafe-signals']) {
+    $exceptions[] = ['kind' => 'unsafe_signal_cleanup_override', 'scope' => 'runtime', 'rows' => null];
 }
 
 $manifestTables = [];
-foreach ($rowCounts as $t => $n) {
-    $manifestTables[$t] = ['action' => $plan[$t]['action'], 'rows' => $n];
+foreach ($rowCounts as $table => $rows) {
+    $manifestTables[$table] = ['action' => $plan[$table]['action'], 'rows' => $rows];
+}
+$manifest = [
+    'generated_at' => gmdate('c'),
+    'tool' => 'shop-anonymizer',
+    'tool_version' => APP_VERSION,
+    'source_database' => $db['name'],
+    'table_prefix' => $p,
+    'server_version' => $version,
+    'privacy_status' => $exceptions ? 'verified_with_exceptions' : 'verified',
+    'order_storage' => array_merge($hpos ? ['hpos'] : [], $legacy ? ['legacy'] : []),
+    'orders_window_months' => $monthsBack ?: null,
+    'attachments_kept' => $keepAttachments,
+    'free_text_action' => $freeTextAction,
+    'service_admin' => $serviceAdmin ? [
+        'login' => $serviceAdmin['login'],
+        'password_stored' => false,
+    ] : null,
+    'pseudonymization' => [
+        'method' => 'value-based deterministic SHA-256 with a private 256-bit seed',
+        'seed_fingerprint' => substr(hash('sha256', $seed), 0, 16),
+        'legal_note' => 'Pseudonymized data remains subject to applicable data-protection obligations.',
+    ],
+    'artifact' => [
+        'file' => $artifactName,
+        'sha256' => $sha,
+        'bytes' => (int)filesize($stageArtifact),
+    ],
+    'checks' => $checkResults,
+    'exceptions' => $exceptions,
+    'cleanup' => [
+        'mode' => $GLOBALS['CTX']['tmp_db_owned'] ? 'drop_owned_schema' : $preparedCleanup,
+        'status' => 'pending',
+    ],
+    'safety' => [
+        'triggers_included' => false,
+        'pcntl_available' => $hasPcntl,
+        'unsafe_signals_override' => !$hasPcntl && $opts['allow-unsafe-signals'],
+    ],
+    'tables' => $manifestTables,
+];
+
+if (!cleanupDatabase()) fail('Working database cleanup failed; no artifact was published.');
+$manifest['cleanup']['status'] = 'complete';
+
+// Remove the generated SQL, seed-bearing script and credentials before publication.
+if (is_file($sqlFile)) {
+    $handle = @fopen($sqlFile, 'r+');
+    if ($handle) {
+        @ftruncate($handle, 0);
+        @fclose($handle);
+    }
+    if (!@unlink($sqlFile)) fail('Could not remove anonymization SQL staging file.');
+}
+$GLOBALS['CTX']['tmp_files'] = array_values(array_diff($GLOBALS['CTX']['tmp_files'], [$sqlFile]));
+if ($GLOBALS['CTX']['defaults_file'] && is_file($GLOBALS['CTX']['defaults_file'])) {
+    if (!@unlink($GLOBALS['CTX']['defaults_file'])) fail('Could not remove MySQL credentials file before publication.');
+    $GLOBALS['CTX']['defaults_file'] = null;
 }
 
-$manifest = [
-        'generated_at'      => gmdate('c'),
-        'tool'              => 'shop-anonymizer',
-        'tool_version'      => APP_VERSION,
-        'tool_vendor'       => 'Xeader',
-        'tool_author'       => 'Antonio Gatta <a.gatta@xeader.com>',
-        'source_database'   => $db['name'],
-        'table_prefix'      => $p,
-        'server_version'    => $version,
-        'order_storage'     => array_merge($hpos ? ['hpos'] : [], $legacy ? ['legacy'] : []),
-        'orders_window'     => $monthsBack ? $monthsBack . ' months' : 'all',
-        'attachments_kept'  => $keepAttachments,
-        'service_admin'     => $serviceAdmin ? $serviceAdmin['login'] : null,
-        'pseudonymization'  => [
-                'method' => 'Deterministic SHA-256 with a persistent seed',
-                'note'   => 'Deterministic transformation: whoever holds the seed can relink the values. Treat this dataset as pseudonymized under GDPR art. 4(5), not anonymized.',
-                'seed_fingerprint' => substr(hash('sha256', $seed), 0, 16),
-        ],
-        'artifact'          => ['file' => basename($outFile), 'sha256' => $sha, 'bytes' => (int)filesize($outFile)],
-        'tables'            => $manifestTables,
-        'checks_passed'     => array_keys($checks),
-];
-file_put_contents($outputDir . '/shop-anon-' . $stamp . '.manifest.json', json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
-file_put_contents($outputDir . '/shop-anon-' . $stamp . '.sha256', $sha . '  ' . basename($outFile) . "\n");
+$checksumName = $artifactStem . '.sha256';
+$stageChecksum = $stageDir . '/' . $checksumName;
+$manifestName = $artifactStem . '.manifest.json';
+$stageManifest = $stageDir . '/' . $manifestName;
+$stageConfig = $stageDir . '/run-config.json';
+writePrivateFile($stageChecksum, $sha . '  ' . $artifactName . "\n");
+$GLOBALS['CTX']['tmp_files'][] = $stageChecksum;
+writePrivateFile(
+    $stageConfig,
+    encodeJsonOrFail($buildRunConfig(), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
+);
+$GLOBALS['CTX']['tmp_files'][] = $stageConfig;
+writePrivateFile(
+    $stageManifest,
+    encodeJsonOrFail($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n"
+);
+$GLOBALS['CTX']['tmp_files'][] = $stageManifest;
 
-$runConfig = [
-        'output_dir' => $outputDir, 'months_back' => $monthsBack, 'keep_attachments' => $keepAttachments,
-        'service_admin_login' => $serviceAdmin['login'] ?? null,
-        'table_actions' => array_map(function ($v) { return $v['action']; }, $plan),
+$destinations = [
+    [$stageArtifact, $outputDir . '/' . $artifactName, false],
+    [$stageChecksum, $outputDir . '/' . $checksumName, false],
+    [$stageConfig, $outputDir . '/run-config.json', true],
+    // The manifest is intentionally last: its presence marks a complete export.
+    [$stageManifest, $outputDir . '/' . $manifestName, false],
 ];
-file_put_contents($outputDir . '/run-config.json', json_encode($runConfig, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-ok('Manifest, checksum and run-config written');
-
+$published = [];
+foreach ($destinations as $publication) {
+    [, $destination, $replace] = $publication;
+    if (is_link($destination) || (!$replace && file_exists($destination))) {
+        fail('Refusing unsafe or existing publication path: ' . $destination);
+    }
+}
+foreach ($destinations as $publication) {
+    [$source, $destination, $replace] = $publication;
+    if (!$replace) $GLOBALS['CTX']['tmp_files'][] = $destination;
+    if (!@rename($source, $destination) || !@chmod($destination, 0600)) {
+        fail('Could not publish private artifact: ' . $destination);
+    }
+    // run-config.json is useful independently (dry runs publish it too), so
+    // retain the updated config if a later artifact publication fails.
+    if (!$replace) $published[] = $destination;
+}
+if (!@rmdir($stageDir)) fail('Could not remove empty staging directory.');
+$GLOBALS['CTX']['tmp_dirs'] = array_values(array_diff($GLOBALS['CTX']['tmp_dirs'], [$stageDir]));
+$GLOBALS['CTX']['tmp_files'] = array_values(array_diff($GLOBALS['CTX']['tmp_files'], $published));
+if ($newSeed) {
+    $GLOBALS['CTX']['tmp_files'] = array_values(array_diff($GLOBALS['CTX']['tmp_files'], [$seedFile]));
+}
 cleanup();
+if (!$GLOBALS['CTX']['cleaned']) fail('Final local cleanup failed.');
 
 hr();
-out(c('  Export complete', 'green'));
-out('  File      : ' . $outFile);
-out('  SHA-256   : ' . $sha);
-if ($serviceAdmin) out('  Account   : ' . $serviceAdmin['login'] . ' / ' . $serviceAdmin['pass']);
-out('  Seed      : ' . $seedFile . '  ' . c('(do not send it along with the dump)', 'yellow'));
+out(c('Export complete', 'green'));
+out('  File       : ' . $outputDir . '/' . $artifactName);
+out('  SHA-256    : ' . $sha);
+out('  Privacy    : ' . $manifest['privacy_status']);
+if ($serviceAdmin) {
+    out('  Account    : ' . $serviceAdmin['login']);
+    out('  Password   : ' . $serviceAdmin['pass'] . '  ' . c('(shown once; not stored)', 'yellow'));
+}
+out('  Seed       : ' . $seedFile . '  ' . c('(never send with the dump)', 'yellow'));
 out('');
-out('  Transfer: encrypt the archive before sending it, for example');
-out('    gpg -c --cipher-algo AES256 ' . escapeshellarg($outFile));
-out('  and share the passphrase over a channel other than the one used for the file.');
-out('  The recipient decrypts it with:');
-out('    gpg --output ' . escapeshellarg(basename($outFile)) . ' --decrypt ' . escapeshellarg(basename($outFile) . '.gpg'));
+out('Encrypt the archive before transfer, for example:');
+out('  gpg -c --cipher-algo AES256 ' . escapeshellarg($outputDir . '/' . $artifactName));
 hr();
