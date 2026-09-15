@@ -283,6 +283,9 @@ directory:
   published.
 - Import a successful artifact into an empty disposable database and run the
   residual queries independently.
+- Exercise a fixture whose metadata columns use `utf8mb4_unicode_520_ci` while
+  the server default is `utf8mb4_general_ci`; the suspicious-key scan must not
+  raise collation error 1267.
 - Validate generated phone, VAT, and tax-code formats/check characters.
 - Confirm order-window deletion leaves no orphaned item meta or related order
   rows in legacy and HPOS storage.

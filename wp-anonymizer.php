@@ -182,7 +182,9 @@ function sqlString(string $value): string
     if ($value === '') return "''";
     // Hex encoding makes the literal independent of NO_BACKSLASH_ESCAPES and
     // prevents database-derived metadata keys from altering generated SQL.
-    return 'CONVERT(0x' . bin2hex($value) . ' USING utf8mb4)';
+    // An explicit binary collation also avoids coercion failures when a site
+    // uses unicode_520_ci, 0900_ai_ci, or another utf8mb4 column collation.
+    return 'CONVERT(0x' . bin2hex($value) . ' USING utf8mb4) COLLATE utf8mb4_bin';
 }
 
 function encodeJsonOrFail($value, int $flags = 0): string
