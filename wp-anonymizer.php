@@ -1341,7 +1341,8 @@ function fakeTaxCode(string $value): string
         $char = 'SUBSTR(' . $base . ',' . $position . ',1)';
         if ($position % 2 === 1) {
             $case = 'CASE ' . $char;
-            foreach ($oddMap as $candidate => $score) $case .= ' WHEN ' . sqlString($candidate) . ' THEN ' . $score;
+            // PHP casts numeric-string array keys ("0"…"9") to int.
+            foreach ($oddMap as $candidate => $score) $case .= ' WHEN ' . sqlString((string)$candidate) . ' THEN ' . $score;
             $sum[] = $case . ' ELSE 0 END';
         } else {
             $sum[] = "IF(" . $char . " BETWEEN '0' AND '9',CAST(" . $char
@@ -1523,16 +1524,17 @@ if ($hpos) {
         $sql[] = 'UPDATE ' . sqlIdentifier($operational) . ' SET order_key='
             . fakeOpaque('order_key', 'order-key', 'wc_order_') . ';';
     }
-    $customers = $p . 'wc_customer_lookup';
-    if ($act($customers)) {
-        $sql[] = 'UPDATE ' . sqlIdentifier($customers) . ' SET '
-            . 'username=' . fakeOpaque('username', 'login', 'user_') . ','
-            . 'first_name=' . pick('_anon_first', 'first_name', 'first-name') . ','
-            . 'last_name=' . pick('_anon_last', 'last_name', 'last-name') . ','
-            . 'email=' . fakeEmail('email') . ','
-            . 'city=' . pick('_anon_city', 'city', 'city') . ','
-            . 'postcode=' . fakeZip('postcode') . ';';
-    }
+}
+
+$customers = $p . 'wc_customer_lookup';
+if ($act($customers)) {
+    $sql[] = 'UPDATE ' . sqlIdentifier($customers) . ' SET '
+        . 'username=' . fakeOpaque('username', 'login', 'user_') . ','
+        . 'first_name=' . pick('_anon_first', 'first_name', 'first-name') . ','
+        . 'last_name=' . pick('_anon_last', 'last_name', 'last-name') . ','
+        . 'email=' . fakeEmail('email') . ','
+        . 'city=' . pick('_anon_city', 'city', 'city') . ','
+        . 'postcode=' . fakeZip('postcode') . ';';
 }
 
 $downloadLog = $p . 'wc_download_log';
