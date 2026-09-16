@@ -537,7 +537,24 @@ if (!is_dir($wpPath) || !is_file($wpPath . '/wp-includes/version.php')) {
 }
 // These WP-CLI config commands run before WordPress bootstrap: no plugins, themes,
 // MU-plugins or drop-ins are loaded.
-$wp = "WP_CLI_PHP_ARGS='-d error_reporting=0 -d display_errors=0' "
+$resolvedWpPath = realpath($wpPath);
+if ($resolvedWpPath === false) fail('Could not resolve WordPress path: ' . $wpPath);
+$wpPath = $resolvedWpPath;
+$GLOBALS['WP_PATH'] = $wpPath;
+
+$wpConfigFile = is_file($wpPath . '/wp-config.php')
+    ? $wpPath . '/wp-config.php'
+    : dirname($wpPath) . '/wp-config.php';
+if (!is_file($wpConfigFile)) {
+    fail('wp-config.php not found in the WordPress directory or its parent.');
+}
+$resolvedWpConfigFile = realpath($wpConfigFile);
+if ($resolvedWpConfigFile === false) fail('Could not resolve wp-config.php path.');
+$wpConfigDir = dirname($resolvedWpConfigFile);
+
+// Custom configurations may load project files through relative paths.
+$wp = 'cd ' . escapeshellarg($wpConfigDir) . ' && '
+    . "WP_CLI_PHP_ARGS='-d error_reporting=0 -d display_errors=0' "
     . escapeshellarg($wpBin) . ' --path=' . escapeshellarg($wpPath)
     . ' --skip-plugins --skip-themes';
 
@@ -855,27 +872,39 @@ foreach ([
         $residualScopes[$scope] = $definition;
     }
 }
+function knownUsermetaPiiKeys(): array
+{
+    return [
+        'session_tokens', '_new_email', '_password_reset_key', '_application_passwords',
+        'first_name', 'last_name', 'nickname', 'billing_email', 'shipping_email', 'billing_phone',
+        'shipping_phone', 'billing_address_1', 'shipping_address_1', 'billing_address_2',
+        'shipping_address_2', 'billing_company', 'shipping_company', 'description',
+        'billing_city', 'shipping_city', 'billing_postcode', 'shipping_postcode',
+    ];
+}
+
+function knownLegacyOrderPiiKeys(): array
+{
+    return [
+        '_billing_first_name', '_shipping_first_name', '_billing_last_name', '_shipping_last_name',
+        '_billing_email', '_shipping_email', '_billing_phone', '_shipping_phone',
+        '_billing_address_1', '_shipping_address_1', '_billing_address_2', '_shipping_address_2',
+        '_billing_company', '_shipping_company', '_billing_city', '_shipping_city',
+        '_billing_postcode', '_shipping_postcode', '_customer_user_agent', '_customer_note',
+        '_customer_ip_address', '_transaction_id', '_order_key', '_payment_tokens',
+        '_stripe_customer_id', '_stripe_source_id', '_paypal_transaction_id',
+    ];
+}
+
 function handledResidualKey(string $scope, string $key): bool
 {
     $lower = strtolower($key);
     if ($scope === 'usermeta') {
-        if (in_array($lower, ['session_tokens', '_new_email', '_password_reset_key', '_application_passwords',
-            'first_name', 'last_name', 'nickname', 'billing_email', 'shipping_email', 'billing_phone',
-            'shipping_phone', 'billing_address_1', 'shipping_address_1', 'billing_address_2',
-            'shipping_address_2', 'billing_company', 'shipping_company', 'description',
-            'billing_city', 'shipping_city', 'billing_postcode', 'shipping_postcode'], true)) return true;
+        if (in_array($lower, knownUsermetaPiiKeys(), true)) return true;
         if (preg_match('/(vat|codice_fiscale|piva|(^|_)cf$)/', $lower)) return true;
     }
     if ($scope === 'postmeta') {
-        if (in_array($lower, [
-            '_billing_first_name', '_shipping_first_name', '_billing_last_name', '_shipping_last_name',
-            '_billing_email', '_shipping_email', '_billing_phone', '_shipping_phone',
-            '_billing_address_1', '_shipping_address_1', '_billing_address_2', '_shipping_address_2',
-            '_billing_company', '_shipping_company', '_billing_city', '_shipping_city',
-            '_billing_postcode', '_shipping_postcode', '_customer_user_agent', '_customer_note',
-            '_customer_ip_address', '_transaction_id', '_order_key', '_payment_tokens',
-            '_stripe_customer_id', '_stripe_source_id', '_paypal_transaction_id',
-        ], true)) return true;
+        if (in_array($lower, knownLegacyOrderPiiKeys(), true)) return true;
         if (preg_match('/(token|secret|api_key|vat|codice_fiscale|piva|(^|_)cf$)/', $lower)) return true;
     }
     if ($scope === 'hpos_order_meta' && preg_match('/(token|secret|api_key|customer_id|vat|codice_fiscale|piva)/', $lower)) return true;
@@ -1253,8 +1282,12 @@ function nonEmptyCase(string $value, string $replacement): string
 
 function pick(string $dict, string $value, string $salt): string
 {
-    $picked = '(SELECT v FROM ' . sqlIdentifier($dict) . ' WHERE n=MOD(CONV(SUBSTR('
-        . h($value, $salt) . ',1,6),16,10),' . DICT_N . '))';
+    $index = 'MOD(CONV(SUBSTR(' . h($value, $salt) . ',1,6),16,10),' . DICT_N . ')';
+    $nextIndex = 'MOD((' . $index . ')+1,' . DICT_N . ')';
+    $picked = '(SELECT v FROM ' . sqlIdentifier($dict)
+        . ' WHERE n IN (' . $index . ',' . $nextIndex . ')'
+        . ' ORDER BY (BINARY LOWER(TRIM(v))=BINARY ' . normalizedSql($value) . ') ASC,'
+        . ' (n=' . $index . ') DESC LIMIT 1)';
     return nonEmptyCase($value, $picked);
 }
 
@@ -1685,10 +1718,12 @@ if ($hasTable($tUsermeta)) {
     $addCheck('usermeta_emails_outside_fake_domain',
         "SELECT COUNT(*) FROM $table WHERE meta_key IN ('billing_email','shipping_email') "
         . "AND meta_value<>'' AND meta_value NOT LIKE '%@" . FAKE_DOMAIN . "'");
+    $knownKeys = implode(',', array_map('sqlString', knownUsermetaPiiKeys()));
     $addCheck('unchanged_known_usermeta_pii',
         "SELECT COUNT(*) FROM $table t JOIN $source s ON s.umeta_id=t.umeta_id "
-        . "WHERE t.meta_value<>'' AND t.meta_value=s.meta_value AND ("
-        . "t.meta_key REGEXP '(first_name|last_name|nickname|email|phone|address|company|city|postcode|vat|piva|codice_fiscale|(^|_)cf$)')");
+        . "WHERE TRIM(CAST(t.meta_value AS CHAR))<>'' AND t.meta_value=s.meta_value AND ("
+        . "LOWER(t.meta_key) IN ($knownKeys) OR "
+        . "LOWER(t.meta_key) REGEXP '(vat|piva|codice_fiscale|(^|_)cf$)')");
 }
 if ($hasTable($tPostmeta)) {
     $table = sqlIdentifier($tPostmeta);
@@ -1696,10 +1731,12 @@ if ($hasTable($tPostmeta)) {
     $addCheck('legacy_order_emails_outside_fake_domain',
         "SELECT COUNT(*) FROM $table WHERE meta_key IN ('_billing_email','_shipping_email') "
         . "AND meta_value<>'' AND meta_value NOT LIKE '%@" . FAKE_DOMAIN . "'");
+    $knownKeys = implode(',', array_map('sqlString', knownLegacyOrderPiiKeys()));
     $addCheck('unchanged_known_legacy_order_pii',
         "SELECT COUNT(*) FROM $table t JOIN $source s ON s.meta_id=t.meta_id "
-        . "WHERE t.meta_value<>'' AND t.meta_value=s.meta_value AND LOWER(t.meta_key) "
-        . "REGEXP '^_(billing|shipping|customer|transaction|order|payment|stripe|paypal)'");
+        . "WHERE TRIM(CAST(t.meta_value AS CHAR))<>'' AND t.meta_value=s.meta_value AND ("
+        . "LOWER(t.meta_key) IN ($knownKeys) OR "
+        . "LOWER(t.meta_key) REGEXP '(vat|piva|codice_fiscale|(^|_)cf$)')");
 }
 if ($hasTable($tComments)) {
     $comments = sqlIdentifier($tComments);
